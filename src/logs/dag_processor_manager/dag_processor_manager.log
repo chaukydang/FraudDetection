@@ -368,3 +368,5 @@
 [2025-12-24T15:18:46.692+0000] {manager.py:824} INFO - There are 0 files in /opt/airflow/dags
 [2025-12-24T15:23:47.166+0000] {manager.py:821} INFO - Searching for files in /opt/airflow/dags
 [2025-12-24T15:23:47.169+0000] {manager.py:824} INFO - There are 0 files in /opt/airflow/dags
+[2025-12-24T15:28:47.665+0000] {manager.py:821} INFO - Searching for files in /opt/airflow/dags
+[2025-12-24T15:28:47.669+0000] {manager.py:824} INFO - There are 0 files in /opt/airflow/dags
