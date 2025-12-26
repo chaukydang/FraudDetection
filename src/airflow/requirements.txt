@@ -1,5 +1,5 @@
 xgboost
-mlflow
+mlflow<3
 kafka-python
 python-dotenv
 pyyaml
@@ -11,4 +11,8 @@ pandas
 scikit-learn
 boto3
 tqdm
-joblib
+tqdm-joblib
+
+# pins to avoid breaking existing packages in global env
+protobuf>=3.20.3,<6
+numpy<2.2.0
