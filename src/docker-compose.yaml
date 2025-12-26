@@ -379,6 +379,8 @@ services:
       mlflow server --host 0.0.0.0 --port 5500
       --backend-store-uri postgresql+psycopg2://mlflow:mlflow@postgres/mlflow
       --default-artifact-root s3://mlflow/
+      --allowed-hosts '*'
+      --uvicorn-opts '--forwarded-allow-ips=*'
     networks:
       - fraud-detection
 
