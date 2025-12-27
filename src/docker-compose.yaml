@@ -494,7 +494,7 @@ services:
       --default-artifact-root s3://mlflow/
       --serve-artifacts
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5500/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:5500/"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -568,9 +568,10 @@ services:
     networks:
       - fraud-detection
 
-  spark-worker:
+  spark-worker-1:
     build: ./spark
     image: spark:3.5.1
+    container_name: spark-worker-1
     depends_on:
       spark-master:
         condition: service_healthy
@@ -579,6 +580,8 @@ services:
       - SPARK_MASTER_URL=spark://spark-master:7077
       - SPARK_WORKER_CORES=2
       - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_PORT=8881
+      - SPARK_WORKER_WEBUI_PORT=8082
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
       - SPARK_RPC_ENCRYPTION_ENABLED=no
       - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
@@ -589,12 +592,53 @@ services:
         "org.apache.spark.deploy.worker.Worker",
         "spark://spark-master:7077"
       ]
+    ports:
+      - "8082:8082"
     volumes:
       - ./spark_checkpoints:/opt/spark-checkpoints
       - ./trainner:/opt/trainner
     deploy:
-      mode: replicated
-      replicas: 2
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    restart: unless-stopped
+    networks:
+      - fraud-detection
+
+  spark-worker-2:
+    build: ./spark
+    image: spark:3.5.1
+    container_name: spark-worker-2
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_PORT=8882
+      - SPARK_WORKER_WEBUI_PORT=8083
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    command:
+      [
+        "/opt/spark/bin/spark-class",
+        "org.apache.spark.deploy.worker.Worker",
+        "spark://spark-master:7077"
+      ]
+    ports:
+      - "8083:8083"
+    volumes:
+      - ./spark_checkpoints:/opt/spark-checkpoints
+      - ./trainner:/opt/trainner
+    deploy:
       resources:
         limits:
           cpus: '2'
