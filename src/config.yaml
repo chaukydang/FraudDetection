@@ -9,7 +9,26 @@ kafka:
   bootstrap_servers: "pkc-41wq6.eu-west-2.aws.confluent.cloud:9092"
   username: "NHM4IZDIBWR3VKO3"
   password: "cflt5JSU5Y7u1uu8gfjlcs6Q9vezT6zp00vy4z0wpQBe2Q2IPTbFunjIKyrTSt/Q"
-  topic: "transactions"
-  output_topic: "fraud_predictions"
+  topic: 
+    transactions: "transactions"
+    fraud_predictions: "fraud_predictions"
+  security:
+    protocol: "SASL_SSL"
+    mechanism: "PLAIN"
 
+minio:
+  endpoint: "http://minio:9000"
+  access_key: "minio"
+  secret_key: "minio123"
+  bucket: "datalake"
 
+spark:
+  starting_offsets: "latest"
+  watermark_minutes: 60
+  checkpoint_root: "/opt/spark-checkpoints"
+
+paths:
+  bronze: "bronze/transactions"
+  silver: "silver/transactions"
+  features: "features/fraud_train"
+  predictions: "predictions"

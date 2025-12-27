@@ -31,14 +31,16 @@ x-airflow-common:
     # AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
     MLFLOW_TRACKING_URI: 'http://mlflow-server:5500'
     MLFLOW_S3_ENDPOINT_URL: 'http://minio:9000'
+    PYTHONPATH: '/opt/airflow:/opt'
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
-    - ./models:/app/models
-    - ./config.yaml:/app/config.yaml
-    - ./.env:/app/.env
+    - ./models:/opt/models
+    - ./config.yaml:/opt/config.yaml
+    - ./.env:/opt/.env
+    - ./trainner:/opt/trainner
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on
@@ -393,6 +395,49 @@ services:
         limits:
           cpus: '1'
           memory: 1G
+    networks:
+      - fraud-detection
+
+  spark-master:
+    build: ./spark
+    image: spark:3.5.1
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=worker
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    ports:
+      - "7077:7077"
+      - "8081:8080"
+    volumes:
+      - ./spark_jobs:/opt/jobs
+      - ./spark_checkpoints:/opt/spark-checkpoints
+      - ./config.yaml:/opt/config.yaml
+      - ./spark_ivy_cache:/opt/ivy-cache
+      - ./trainner:/opt/trainner
+      - ./.env:/opt/.env
+    networks:
+      - fraud-detection
+
+  spark-worker:
+    build: ./spark
+    image: spark:3.5.1
+    container_name: spark-worker
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
+    command:
+      [
+        "/opt/spark/bin/spark-class",
+        "org.apache.spark.deploy.worker.Worker",
+        "spark://spark-master:7077"
+      ]
+    depends_on:
+      - spark-master
+    volumes:
+      - ./spark_checkpoints:/opt/spark-checkpoints
+      - ./trainner:/opt/trainner
     networks:
       - fraud-detection
 
