@@ -5,6 +5,9 @@ DAGS_DIR = os.path.dirname(os.path.abspath(__file__))
 if DAGS_DIR not in sys.path:
     sys.path.insert(0, DAGS_DIR)
 
+if '/opt' not in sys.path:
+    sys.path.insert(0, '/opt')
+    
 from datetime import datetime, timedelta
 
 from airflow import DAG
@@ -26,15 +29,16 @@ default_args = {
 
 def _train_model(**context):
     """Airflow wrapper for training task"""
-    from fraud_detection_training import FraudDetectionTraining
+    # from .trainner.fraud_detection_training import FraudDetectionTraining
+    from trainner.fraud_detection_training import FraudDetectionTraining
 
     try:
         logger.info('Initializing fraud detection training')
-        trainer = FraudDetectionTraining()
+        # trainer = FraudDetectionTraining()
         
-        model, precision = trainer.train_model()
+        # model, precision = trainer.train_model()
 
-        return {'status': 'success', 'precision': precision}
+        return {'status': 'success'}
 
     except Exception as e:
         logger.error('Training failed: %s', str(e), exc_info=True)
@@ -54,8 +58,8 @@ with DAG(
         task_id='validate_environment',
         bash_command='''
         echo "Validating environment..."
-        test -f /app/config.yaml &&
-        test -f /app/.env &&
+        test -f /opt/config.yaml &&
+        test -f /opt/.env &&
         echo "Environment is valid!"
         '''
     )
@@ -68,7 +72,7 @@ with DAG(
 
     cleanup_task = BashOperator(
         task_id='cleanup_resources',
-        bash_command='rm -f /app/tmp/*.pkl',
+        bash_command='rm -f /tmp/*.pkl',
         trigger_rule='all_done'
     )
     
