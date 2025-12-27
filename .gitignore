@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .env
 config.yaml
+jars/
+logs/
+data/
+cache/
+spark_ivy_cache/
