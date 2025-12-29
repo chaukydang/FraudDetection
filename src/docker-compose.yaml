@@ -1,12 +1,9 @@
----
-x-airflow-common:
-  &airflow-common
-  build: ./airflow
+x-airflow-common: &airflow-common
+  build: ./infra/airflow
   image: airflow-training:latest
   env_file:
-    - ${ENV_FILE_PATH:-.env}
-  environment:
-    &airflow-common-env
+    - ${ENV_FILE_PATH:-shared/.env}
+  environment: &airflow-common-env
     # Core Configuration
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
@@ -16,56 +13,56 @@ x-airflow-common:
     AIRFLOW__CORE__PARALLELISM: 32
     AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 16
     AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: 3
-    
+
     # Database Configuration
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE: 10
     AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_RECYCLE: 1800
     AIRFLOW__DATABASE__SQL_ALCHEMY_MAX_OVERFLOW: 20
     AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_PRE_PING: 'true'
-    
+
     # Celery Configuration
     AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
     AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
     AIRFLOW__CELERY__WORKER_CONCURRENCY: 16
     AIRFLOW__CELERY__BROKER_CONNECTION_RETRY_ON_STARTUP: 'true'
-    
+
     # Webserver Configuration
     AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: 120
     AIRFLOW__WEBSERVER__WORKER_REFRESH_INTERVAL: 1800
     AIRFLOW__WEBSERVER__WORKER_REFRESH_BATCH_SIZE: 0
     AIRFLOW__WEBSERVER__RELOAD_ON_PLUGIN_CHANGE: 'false'
-    
+
     # Scheduler Configuration
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
     AIRFLOW__SCHEDULER__PARSING_PROCESSES: 2
     AIRFLOW__SCHEDULER__SCHEDULER_HEARTBEAT_SEC: 5
-    
+
     # Logging
     AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
-    
+
     # External Services
     MLFLOW_TRACKING_URI: 'http://mlflow-server:5500'
     MLFLOW_S3_ENDPOINT_URL: 'http://minio:9000'
-    
+
     # Python Path
     PYTHONPATH: '/opt/airflow:/opt'
-    
-    # Additional Requirements (use with caution)
+
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
-    
+
   volumes:
-    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
-    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
-    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
-    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
-    - ./models:/opt/models
-    - ./config.yaml:/opt/config.yaml
-    - ./.env:/opt/.env
-    - ./trainner:/opt/trainner
+    - ./apps/airflow/dags:/opt/airflow/dags
+    - ./.local/airflow/logs:/opt/airflow/logs
+    - ./apps/airflow/config:/opt/airflow/config
+    - ./apps/airflow/plugins:/opt/airflow/plugins
+
+    - ./shared/models:/opt/models
+    - ./shared/config.yaml:/opt/config.yaml
+    - ./shared/.env:/opt/.env
+    - ./shared/trainner:/opt/trainner
+
   user: "${AIRFLOW_UID:-50000}:0"
-  depends_on:
-    &airflow-common-depends-on
+  depends_on: &airflow-common-depends-on
     redis:
       condition: service_healthy
     postgres:
@@ -100,20 +97,12 @@ services:
       -c max_wal_size=4GB
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
-      - ./init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh
+      - ./scripts/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 10s
       retries: 5
       start_period: 10s
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 2G
-        reservations:
-          cpus: '0.5'
-          memory: 512M
     restart: always
     networks:
       - fraud-detection
@@ -130,10 +119,6 @@ services:
       timeout: 30s
       retries: 50
       start_period: 30s
-    deploy:
-      resources:
-        limits:
-          memory: 512M
     restart: always
     networks:
       - fraud-detection
@@ -149,7 +134,6 @@ services:
       - "8080:8080"
     environment:
       <<: *airflow-common-env
-      # Gunicorn specific settings
       GUNICORN_CMD_ARGS: "--timeout 120 --workers 4 --worker-class sync --log-level info --max-requests 1000 --max-requests-jitter 50"
     healthcheck:
       test: ["CMD-SHELL", "curl --fail http://localhost:8080/health || exit 1"]
@@ -157,14 +141,6 @@ services:
       timeout: 30s
       retries: 5
       start_period: 120s
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 4G
-        reservations:
-          cpus: '1'
-          memory: 2G
     restart: always
     depends_on:
       <<: *airflow-common-depends-on
@@ -183,14 +159,6 @@ services:
       timeout: 30s
       retries: 5
       start_period: 60s
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 4G
-        reservations:
-          cpus: '1'
-          memory: 2G
     restart: always
     depends_on:
       <<: *airflow-common-depends-on
@@ -209,21 +177,13 @@ services:
       timeout: 30s
       retries: 5
       start_period: 60s
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 2G
-        reservations:
-          cpus: '0.5'
-          memory: 1G
     restart: always
     depends_on:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
     networks:
-      - fraud-detection 
+      - fraud-detection
 
   airflow-worker:
     <<: *airflow-common
@@ -239,19 +199,11 @@ services:
     environment:
       <<: *airflow-common-env
       DUMB_INIT_SETSID: "0"
-      # Worker specific settings
       AIRFLOW__CELERY__WORKER_PREFETCH_MULTIPLIER: 1
       AIRFLOW__CELERY__WORKER_CONCURRENCY: 16
     deploy:
       mode: replicated
       replicas: 2
-      resources:
-        limits:
-          cpus: '2'
-          memory: 4G
-        reservations:
-          cpus: '1'
-          memory: 2G
     restart: always
     depends_on:
       <<: *airflow-common-depends-on
@@ -272,14 +224,6 @@ services:
       timeout: 30s
       retries: 5
       start_period: 60s
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 1G
-        reservations:
-          cpus: '0.5'
-          memory: 512M
     restart: always
     depends_on:
       <<: *airflow-common-depends-on
@@ -296,79 +240,14 @@ services:
       - -c
       - |
         if [[ -z "${AIRFLOW_UID}" ]]; then
-          echo
           echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
-          echo "If you are on Linux, you SHOULD follow the instructions below to set "
-          echo "AIRFLOW_UID environment variable, otherwise files will be owned by root."
-          echo "For other operating systems you can get rid of the warning with manually created .env file:"
-          echo "    See: https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#setting-the-right-airflow-user"
-          echo
           export AIRFLOW_UID=$$(id -u)
         fi
-        one_meg=1048576
-        mem_available=$$(($$(getconf _PHYS_PAGES) * $$(getconf PAGE_SIZE) / one_meg))
-        cpus_available=$$(grep -cE 'cpu[0-9]+' /proc/stat)
-        disk_available=$$(df / | tail -1 | awk '{print $$4}')
-        warning_resources="false"
-        if (( mem_available < 4000 )) ; then
-          echo
-          echo -e "\033[1;33mWARNING!!!: Not enough memory available for Docker.\e[0m"
-          echo "At least 4GB of memory required. You have $$(numfmt --to iec $$((mem_available * one_meg)))"
-          echo
-          warning_resources="true"
-        fi
-        if (( cpus_available < 2 )); then
-          echo
-          echo -e "\033[1;33mWARNING!!!: Not enough CPUS available for Docker.\e[0m"
-          echo "At least 2 CPUs recommended. You have $${cpus_available}"
-          echo
-          warning_resources="true"
-        fi
-        if (( disk_available < one_meg * 10 )); then
-          echo
-          echo -e "\033[1;33mWARNING!!!: Not enough Disk space available for Docker.\e[0m"
-          echo "At least 10 GBs recommended. You have $$(numfmt --to iec $$((disk_available * 1024 )))"
-          echo
-          warning_resources="true"
-        fi
-        if [[ $${warning_resources} == "true" ]]; then
-          echo
-          echo -e "\033[1;33mWARNING!!!: You have not enough resources to run Airflow (see above)!\e[0m"
-          echo "Please follow the instructions to increase amount of resources available:"
-          echo "   https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#before-you-begin"
-          echo
-        fi
-        echo
-        echo "Creating missing opt dirs if missing:"
-        echo
         mkdir -v -p /opt/airflow/{logs,dags,plugins,config}
-        echo
-        echo "Airflow version:"
         /entrypoint airflow version
-        echo
-        echo "Files in shared volumes:"
-        echo
-        ls -la /opt/airflow/{logs,dags,plugins,config}
-        echo
-        echo "Running airflow config list to create default config file if missing."
-        echo
         /entrypoint airflow config list >/dev/null
-        echo
-        echo "Files in shared volumes:"
-        echo
-        ls -la /opt/airflow/{logs,dags,plugins,config}
-        echo
-        echo "Change ownership of files in /opt/airflow to ${AIRFLOW_UID}:0"
-        echo
         chown -R "${AIRFLOW_UID}:0" /opt/airflow/
-        echo
-        echo "Change ownership of files in shared volumes to ${AIRFLOW_UID}:0"
-        echo
         chown -v -R "${AIRFLOW_UID}:0" /opt/airflow/{logs,dags,plugins,config}
-        echo
-        echo "Files in shared volumes:"
-        echo
-        ls -la /opt/airflow/{logs,dags,plugins,config}
     environment:
       <<: *airflow-common-env
       _AIRFLOW_DB_MIGRATE: 'true'
@@ -380,49 +259,6 @@ services:
     networks:
       - fraud-detection
 
-  airflow-cli:
-    <<: *airflow-common
-    profiles:
-      - debug
-    environment:
-      <<: *airflow-common-env
-      CONNECTION_CHECK_MAX_COUNT: "0"
-    command:
-      - bash
-      - -c
-      - airflow
-    depends_on:
-      <<: *airflow-common-depends-on
-    networks:
-      - fraud-detection
-
-  flower:
-    <<: *airflow-common
-    container_name: flower
-    command: celery flower
-    profiles:
-      - flower
-    ports:
-      - "5555:5555"
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
-      interval: 60s
-      timeout: 30s
-      retries: 5
-      start_period: 60s
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 1G
-    restart: always
-    depends_on:
-      <<: *airflow-common-depends-on
-      airflow-init:
-        condition: service_completed_successfully
-    networks:
-      - fraud-detection
-
   # ============================================================================
   # STORAGE SERVICES (MinIO + MLflow)
   # ============================================================================
@@ -431,23 +267,19 @@ services:
     platform: linux/amd64
     container_name: minio
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # MinIO Console (UI)
+      - "9000:9000"
+      - "9001:9001"
     command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
     environment:
-      - MINIO_ROOT_USER=${MINIO_USERNAME:-minioadmin}
-      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD:-minioadmin}
+      - MINIO_ROOT_USER=${MINIO_USERNAME}
+      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}
     volumes:
-      - minio_data:/data
+      - ./.local/minio/data:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
       timeout: 20s
       retries: 3
-    deploy:
-      resources:
-        limits:
-          memory: 2G
     restart: always
     networks:
       - fraud-detection
@@ -460,21 +292,21 @@ services:
       minio:
         condition: service_healthy
     env_file:
-      - .env
+      - shared/.env
     entrypoint: >
       /bin/sh -c "
       /tmp/wait-for-it.sh minio:9000 -t 60 &&
-      /usr/bin/mc alias set minio http://minio:9000 ${AWS_ACCESS_KEY_ID:-minioadmin} ${AWS_SECRET_ACCESS_KEY:-minioadmin} &&
+      /usr/bin/mc alias set minio http://minio:9000 ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY} &&
       /usr/bin/mc mb minio/mlflow --ignore-existing;
       exit 0;
       "
     volumes:
-      - ./wait-for-it.sh:/tmp/wait-for-it.sh
+      - ./scripts/wait-for-it.sh:/tmp/wait-for-it.sh
     networks:
       - fraud-detection
 
   mlflow-server:
-    build: ./mlflow
+    build: ./infra/mlflow
     image: mlflow-server
     container_name: mlflow-server
     depends_on:
@@ -486,24 +318,22 @@ services:
       - "5500:5500"
     environment:
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
     command: >
       mlflow server --host 0.0.0.0 --port 5500
       --backend-store-uri postgresql+psycopg2://mlflow:mlflow@postgres/mlflow
       --default-artifact-root s3://mlflow/
       --serve-artifacts
+      --allowed-hosts "mlflow-server,mlflow-server:5500,localhost,localhost:5500,127.0.0.1,127.0.0.1:5500,178.128.69.202,178.128.69.202:5500"
+      --cors-allowed-origins "http://localhost:5500,http://127.0.0.1:5500,http://178.128.69.202:5500"
+      --uvicorn-opts "--timeout-keep-alive 120"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5500/"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 30s
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 2G
     restart: always
     networks:
       - fraud-detection
@@ -512,18 +342,26 @@ services:
   # DATA PRODUCER SERVICE
   # ============================================================================
   producer:
-    build: ./producer
-    env_file: .env
+    build: ./apps/producer
+    env_file: shared/.env
+    environment:
+      BATCH_MESSAGES: "400"
+      BATCH_SLEEP_SEC: "0.6"
+      POLL_TIMEOUT_SEC: "0.2"
+      ENABLE_VALIDATE: "0"
+      VALIDATE_EVERY_N: "500"
+      LOG_EVERY_N: "2000"
+      KAFKA_COMPRESSION: "snappy"
+      KAFKA_LINGER_MS: "20"
+      KAFKA_BATCH_SIZE: "65536"
+      KAFKA_QUEUE_KB: "10240"
+      FAST_MERCHANTS: "1"
     deploy:
       replicas: 2
-      resources:
-        limits:
-          cpus: '1'
-          memory: 1G
-        reservations:
-          cpus: '0.5'
-          memory: 512M
     restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     networks:
       - fraud-detection
 
@@ -531,137 +369,100 @@ services:
   # SPARK CLUSTER
   # ============================================================================
   spark-master:
-    build: ./spark
+    build: ./infra/spark
     image: spark:3.5.1
     container_name: spark-master
     environment:
       - SPARK_MODE=master
-      - SPARK_RPC_AUTHENTICATION_ENABLED=no
-      - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-      - SPARK_SSL_ENABLED=no
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    command: >
+      /bin/bash -lc "
+      mkdir -p /opt/ivy-cache /opt/spark/work /opt/spark-checkpoints &&
+      chmod -R 777 /opt/ivy-cache /opt/spark/work /opt/spark-checkpoints || true &&
+      exec /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+      "
     ports:
-      - "7077:7077"   # Spark Master Port
-      - "8081:8080"   # Spark Master Web UI
+      - "7077:7077"
+      - "8081:8080"
     volumes:
-      - ./spark_jobs:/opt/jobs
-      - ./spark_checkpoints:/opt/spark-checkpoints
-      - ./config.yaml:/opt/config.yaml
-      - ./spark_ivy_cache:/opt/ivy-cache
-      - ./trainner:/opt/trainner
-      - ./.env:/opt/.env
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 4G
-        reservations:
-          cpus: '1'
-          memory: 2G
+      - ./infra/spark/conf:/opt/spark/conf:ro
+      - ./.local/spark/ivy-cache:/opt/ivy-cache
+      - ./.local/spark/checkpoints:/opt/spark-checkpoints
+      - ./.local/spark/work/master:/opt/spark/work
+      - ./apps/spark_jobs:/opt/jobs
+      - ./shared/config.yaml:/opt/config.yaml
+      - ./shared/trainner:/opt/trainner
+      - ./shared/.env:/opt/.env
     restart: unless-stopped
     networks:
       - fraud-detection
 
-  spark-worker-1:
-    build: ./spark
+  spark-worker-streaming:
+    build: ./infra/spark
     image: spark:3.5.1
-    container_name: spark-worker-1
+    container_name: spark-worker-streaming
     depends_on:
       spark-master:
-        condition: service_healthy
+        condition: service_started
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:7077
       - SPARK_WORKER_CORES=2
-      - SPARK_WORKER_MEMORY=2g
-      - SPARK_WORKER_PORT=8881
-      - SPARK_WORKER_WEBUI_PORT=8082
-      - SPARK_RPC_AUTHENTICATION_ENABLED=no
-      - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-      - SPARK_SSL_ENABLED=no
-    command:
-      [
-        "/opt/spark/bin/spark-class",
-        "org.apache.spark.deploy.worker.Worker",
-        "spark://spark-master:7077"
-      ]
+      - SPARK_WORKER_MEMORY=1536m
+    command: >
+      /bin/bash -lc "
+      mkdir -p /opt/ivy-cache /opt/spark/work /opt/spark-checkpoints &&
+      chmod -R 777 /opt/ivy-cache /opt/spark/work /opt/spark-checkpoints || true &&
+      exec /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+      "
     ports:
       - "8082:8082"
     volumes:
-      - ./spark_checkpoints:/opt/spark-checkpoints
-      - ./trainner:/opt/trainner
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 2G
-        reservations:
-          cpus: '1'
-          memory: 1G
+      - ./infra/spark/conf:/opt/spark/conf:ro
+      - ./.local/spark/ivy-cache:/opt/ivy-cache
+      - ./.local/spark/checkpoints:/opt/spark-checkpoints
+      - ./.local/spark/work/worker-streaming:/opt/spark/work
+      - ./shared/trainner:/opt/trainner
+      - ./shared/.env:/opt/.env
     restart: unless-stopped
     networks:
       - fraud-detection
 
-  spark-worker-2:
-    build: ./spark
+  spark-worker-training:
+    build: ./infra/spark
     image: spark:3.5.1
-    container_name: spark-worker-2
+    container_name: spark-worker-training
     depends_on:
       spark-master:
-        condition: service_healthy
+        condition: service_started
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:7077
       - SPARK_WORKER_CORES=2
-      - SPARK_WORKER_MEMORY=2g
-      - SPARK_WORKER_PORT=8882
-      - SPARK_WORKER_WEBUI_PORT=8083
-      - SPARK_RPC_AUTHENTICATION_ENABLED=no
-      - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-      - SPARK_SSL_ENABLED=no
-    command:
-      [
-        "/opt/spark/bin/spark-class",
-        "org.apache.spark.deploy.worker.Worker",
-        "spark://spark-master:7077"
-      ]
+      - SPARK_WORKER_MEMORY=2560m
+    command: >
+      /bin/bash -lc "
+      mkdir -p /opt/ivy-cache /opt/spark/work /opt/spark-checkpoints &&
+      chmod -R 777 /opt/ivy-cache /opt/spark/work /opt/spark-checkpoints || true &&
+      exec /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+      "
     ports:
       - "8083:8083"
     volumes:
-      - ./spark_checkpoints:/opt/spark-checkpoints
-      - ./trainner:/opt/trainner
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 2G
-        reservations:
-          cpus: '1'
-          memory: 1G
+      - ./infra/spark/conf:/opt/spark/conf:ro
+      - ./.local/spark/ivy-cache:/opt/ivy-cache
+      - ./.local/spark/checkpoints:/opt/spark-checkpoints
+      - ./.local/spark/work/worker-training:/opt/spark/work
+      - ./shared/trainner:/opt/trainner
+      - ./shared/models:/opt/models
+      - ./shared/.env:/opt/.env
     restart: unless-stopped
     networks:
       - fraud-detection
 
-# ============================================================================
-# VOLUMES
-# ============================================================================
 volumes:
   postgres-db-volume:
     driver: local
-  minio_data:
-    driver: local
 
-# ============================================================================
-# NETWORKS
-# ============================================================================
 networks:
   fraud-detection:
     driver: bridge
