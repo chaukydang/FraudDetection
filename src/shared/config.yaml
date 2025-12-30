@@ -1,0 +1,43 @@
+mlflow:
+  experiment_name: "fraud_detection"
+  registered_model_name: "fraud_detection_xgboost"
+  tracking_uri: "http://mlflow-server:5500"
+  artifact_location: "s3://mlflow/fraud_detection"
+  s3_endpoint_url: "http://minio:9000"
+  bucket: "mlflow"
+
+kafka:
+  bootstrap_servers: "pkc-41wq6.eu-west-2.aws.confluent.cloud:9092"
+  username: "NHM4IZDIBWR3VKO3"
+  password: "cflt5JSU5Y7u1uu8gfjlcs6Q9vezT6zp00vy4z0wpQBe2Q2IPTbFunjIKyrTSt/Q"
+  topic: 
+    transactions: "transactions"
+    fraud_predictions: "fraud_predictions"
+  security:
+    protocol: "SASL_SSL"
+    mechanism: "PLAIN"
+
+minio:
+  endpoint: "http://minio:9000"
+  access_key: "minio"
+  secret_key: "minio123"
+  bucket: "datalake"
+  raw_prefix: "raw/transactions"
+
+paths:
+  bronze: "bronze/transactions"
+  silver: "silver/transactions"
+
+spark:
+  log_level: WARN
+  starting_offsets: latest
+  max_offsets_per_trigger: 200
+  checkpoint_root: /opt/spark-checkpoints
+  trigger_bronze_silver: "30 seconds"
+
+  shuffle_partitions: 8
+  write_partitions: 2
+  max_records_per_file: 200000
+
+  watermark_minutes: 10
+  enable_stateful_dedup: false
