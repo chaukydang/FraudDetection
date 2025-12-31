@@ -55,10 +55,10 @@ x-airflow-common:
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
     
   volumes:
-    - ${AIRFLOW_PROJ_DIR:-.}/apps/airflow/dags:/opt/airflow/dags
-    - ${AIRFLOW_PROJ_DIR:-.}/apps/airflow/logs:/opt/airflow/logs
-    - ${AIRFLOW_PROJ_DIR:-.}/apps/airflow/config:/opt/airflow/config
-    - ${AIRFLOW_PROJ_DIR:-.}/apps/airflow/plugins:/opt/airflow/plugins
+    - ./apps/airflow/dags:/opt/airflow/dags
+    - ./apps/airflow/logs:/opt/airflow/logs
+    - ./apps/airflow/config:/opt/airflow/config
+    - ./apps/airflow/plugins:/opt/airflow/plugins
     - ./shared/models:/opt/models
     - ./shared/config.yaml:/opt/config.yaml
     - ./shared/.env:/opt/.env
