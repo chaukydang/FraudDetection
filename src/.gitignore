@@ -28,3 +28,4 @@ ccloud-python-client/
 
 spark-defaults.conf
 config.yaml
+.DS_Store
