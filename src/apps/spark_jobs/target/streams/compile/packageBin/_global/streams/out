@@ -1,0 +1,11 @@
+[0m[[0m[0mdebug[0m] [0m[0mPackaging /Users/dangchauky/Documents/dev/FraudDetection/src/apps/spark_jobs/target/scala-2.12/spark_jobs_2.12-0.1.0.jar ...[0m
+[0m[[0m[0mdebug[0m] [0m[0mInput file mappings:[0m
+[0m[[0m[0mdebug[0m] [0m[0m	TrainFraudXGB.class[0m
+[0m[[0m[0mdebug[0m] [0m[0m	  /Users/dangchauky/Documents/dev/FraudDetection/src/apps/spark_jobs/target/scala-2.12/classes/TrainFraudXGB.class[0m
+[0m[[0m[0mdebug[0m] [0m[0m	TrainFraudXGB$.class[0m
+[0m[[0m[0mdebug[0m] [0m[0m	  /Users/dangchauky/Documents/dev/FraudDetection/src/apps/spark_jobs/target/scala-2.12/classes/TrainFraudXGB$.class[0m
+[0m[[0m[0mdebug[0m] [0m[0m	TrainFraudXGB$Args$.class[0m
+[0m[[0m[0mdebug[0m] [0m[0m	  /Users/dangchauky/Documents/dev/FraudDetection/src/apps/spark_jobs/target/scala-2.12/classes/TrainFraudXGB$Args$.class[0m
+[0m[[0m[0mdebug[0m] [0m[0m	TrainFraudXGB$Args.class[0m
+[0m[[0m[0mdebug[0m] [0m[0m	  /Users/dangchauky/Documents/dev/FraudDetection/src/apps/spark_jobs/target/scala-2.12/classes/TrainFraudXGB$Args.class[0m
+[0m[[0m[0mdebug[0m] [0m[0mDone packaging.[0m

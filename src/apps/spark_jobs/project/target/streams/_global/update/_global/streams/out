@@ -1,0 +1,7 @@
+[0m[[0m[0mdebug[0m] [0m[0mnot up to date. inChanged = true, force = false[0m
+[0m[[0m[0mdebug[0m] [0m[0mUpdating ProjectRef(uri("file:/Users/dangchauky/Documents/dev/FraudDetection/src/apps/spark_jobs/project/"), "spark_jobs-build")...[0m
+[0m[[0m[0minfo[0m] [0m[0mUpdating spark_jobs-build[0m
+[0m[[0m[0minfo[0m] [0m[0mResolved spark_jobs-build dependencies[0m
+[0m[[0m[0minfo[0m] [0m[0mFetching artifacts of spark_jobs-build[0m
+[0m[[0m[0minfo[0m] [0m[0mFetched artifacts of spark_jobs-build[0m
+[0m[[0m[0mdebug[0m] [0m[0mDone updating ProjectRef(uri("file:/Users/dangchauky/Documents/dev/FraudDetection/src/apps/spark_jobs/project/"), "spark_jobs-build")[0m

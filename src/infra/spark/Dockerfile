@@ -1,13 +1,14 @@
-FROM apache/spark:3.5.1
+FROM apache/spark:3.5.1-scala2.12-java17-ubuntu
 
 USER root
 
-# Ensure Spark conf dir exists (some images may not ship it pre-created)
-RUN mkdir -p /opt/spark/conf /opt/ivy-cache /opt/spark/work /opt/spark-checkpoints \
- && chmod -R 777 /opt/ivy-cache /opt/spark/work /opt/spark-checkpoints || true
-
-# Optional: copy custom jars if you put them into infra/spark/jars/
-# (kept safe even if folder is empty)
-COPY jars/ /opt/spark/jars/
+RUN set -eux; \
+  apt-get update; \
+  apt-get install -y --no-install-recommends \
+    python3 python3-pip python-is-python3 \
+    ca-certificates \
+    libgomp1 \
+  ; \
+  rm -rf /var/lib/apt/lists/*
 
 USER spark

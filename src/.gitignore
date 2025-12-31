@@ -25,3 +25,6 @@ spark-checkpoints/
 
 # Third-party
 ccloud-python-client/
+
+spark-defaults.conf
+config.yaml
