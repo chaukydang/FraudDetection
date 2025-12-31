@@ -1,7 +1,7 @@
 ---
 x-airflow-common:
   &airflow-common
-  build: ./airflow
+  build: ./infra/airflow
   image: airflow-training:latest
   env_file:
     - ${ENV_FILE_PATH:-.env}
@@ -55,14 +55,14 @@ x-airflow-common:
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
     
   volumes:
-    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
-    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
-    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
-    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
-    - ./models:/opt/models
-    - ./config.yaml:/opt/config.yaml
-    - ./.env:/opt/.env
-    - ./trainner:/opt/trainner
+    - ${AIRFLOW_PROJ_DIR:-.}/apps/airflow/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/apps/airflow/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/apps/airflow/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/apps/airflow/plugins:/opt/airflow/plugins
+    - ./shared/models:/opt/models
+    - ./shared/config.yaml:/opt/config.yaml
+    - ./shared/.env:/opt/.env
+    - ./shared/trainner:/opt/trainner
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on
@@ -100,7 +100,7 @@ services:
       -c max_wal_size=4GB
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
-      - ./init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh
+      - ./scripts/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 10s
@@ -435,10 +435,10 @@ services:
       - "9001:9001"   # MinIO Console (UI)
     command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
     environment:
-      - MINIO_ROOT_USER=${MINIO_USERNAME:-minioadmin}
-      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD:-minioadmin}
+      - MINIO_ROOT_USER=${MINIO_USERNAME}
+      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}
     volumes:
-      - minio_data:/data
+      - ./.local/minio/data:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
@@ -464,17 +464,17 @@ services:
     entrypoint: >
       /bin/sh -c "
       /tmp/wait-for-it.sh minio:9000 -t 60 &&
-      /usr/bin/mc alias set minio http://minio:9000 ${AWS_ACCESS_KEY_ID:-minioadmin} ${AWS_SECRET_ACCESS_KEY:-minioadmin} &&
+      /usr/bin/mc alias set minio http://minio:9000 ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY} &&
       /usr/bin/mc mb minio/mlflow --ignore-existing;
       exit 0;
       "
     volumes:
-      - ./wait-for-it.sh:/tmp/wait-for-it.sh
+      - ./scripts/wait-for-it.sh:/tmp/wait-for-it.sh
     networks:
       - fraud-detection
 
   mlflow-server:
-    build: ./mlflow
+    build: ./infra/mlflow
     image: mlflow-server
     container_name: mlflow-server
     depends_on:
@@ -486,8 +486,8 @@ services:
       - "5500:5500"
     environment:
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
     command: >
       mlflow server --host 0.0.0.0 --port 5500
       --backend-store-uri postgresql+psycopg2://mlflow:mlflow@postgres/mlflow
@@ -512,27 +512,44 @@ services:
   # DATA PRODUCER SERVICE
   # ============================================================================
   producer:
-    build: ./producer
+    build: ./apps/producer
     env_file: .env
+    environment:
+      # Tối ưu CPU/RAM cho producer
+      BATCH_MESSAGES: "400"
+      BATCH_SLEEP_SEC: "0.6"
+      POLL_TIMEOUT_SEC: "0.2"
+      ENABLE_VALIDATE: "0"
+      VALIDATE_EVERY_N: "500"
+      LOG_EVERY_N: "2000"
+      KAFKA_COMPRESSION: "snappy"
+      KAFKA_LINGER_MS: "20"
+      KAFKA_BATCH_SIZE: "65536"
+      KAFKA_QUEUE_KB: "10240"
+      FAST_MERCHANTS: "1"
     deploy:
       replicas: 2
       resources:
         limits:
-          cpus: '1'
-          memory: 1G
-        reservations:
           cpus: '0.5'
           memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 256M
     restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     networks:
       - fraud-detection
 
   # ============================================================================
-  # SPARK CLUSTER
+  # SPARK CLUSTER - TỐI ƯU CHO TRAINING + STREAMING
   # ============================================================================
   spark-master:
-    build: ./spark
+    build: ./infra/spark
     image: spark:3.5.1
+    platform: linux/amd64
     container_name: spark-master
     environment:
       - SPARK_MODE=master
@@ -540,37 +557,55 @@ services:
       - SPARK_RPC_ENCRYPTION_ENABLED=no
       - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
       - SPARK_SSL_ENABLED=no
+      
+      - SPARK_DAEMON_MEMORY=2g
+      
+      - SPARK_MASTER_OPTS=-XX:+UseG1GC -XX:G1HeapRegionSize=16m -XX:InitiatingHeapOccupancyPercent=35 -XX:MaxGCPauseMillis=200 -XX:+ParallelRefProcEnabled -XX:+UnlockExperimentalVMOptions -XX:+AlwaysPreTouch
+      
+      # AWS/MinIO
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_ENDPOINT=http://minio:9000
+      - TRAIN_DATA_PATH=s3a://datalake/gold/fraud_features
+      - MODEL_OUT=/opt/models/xgb_fraud
     command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
     ports:
       - "7077:7077"   # Spark Master Port
       - "8081:8080"   # Spark Master Web UI
     volumes:
-      - ./spark_jobs:/opt/jobs
-      - ./spark_checkpoints:/opt/spark-checkpoints
-      - ./config.yaml:/opt/config.yaml
-      - ./spark_ivy_cache:/opt/ivy-cache
-      - ./trainner:/opt/trainner
-      - ./.env:/opt/.env
+      - ./apps/spark_jobs:/opt/jobs
+      - ./.local/spark/checkpoints:/opt/spark-checkpoints
+      - ./shared/config.yaml:/opt/config.yaml
+      - ./.local/spark/ivy_cache:/opt/ivy-cache
+      - ./shared/trainner:/opt/trainner
+      - ./shared/.env:/opt/.env
+      - ./.local/spark/work/master:/opt/spark/work
+      - ./shared/models:/opt/models
+      - ./infra/spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 20s
     deploy:
       resources:
         limits:
           cpus: '2'
-          memory: 4G
+          memory: 6G  
         reservations:
-          cpus: '1'
+          cpus: '0.5'
           memory: 2G
     restart: unless-stopped
     networks:
       - fraud-detection
 
-  spark-worker:
-    build: ./spark
+  # Worker cho STREAMING (Kafka → Realtime Inference)
+  spark-worker-streaming:
+    build: ./infra/spark
     image: spark:3.5.1
+    platform: linux/amd64
+    container_name: spark-worker-streaming
     depends_on:
       spark-master:
         condition: service_healthy
@@ -578,30 +613,98 @@ services:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:7077
       - SPARK_WORKER_CORES=2
-      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_MEMORY=1536m
+      - SPARK_WORKER_PORT=8881
+      - SPARK_WORKER_WEBUI_PORT=8082
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
       - SPARK_RPC_ENCRYPTION_ENABLED=no
       - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
       - SPARK_SSL_ENABLED=no
+      - SPARK_DAEMON_MEMORY=512m
+      - SPARK_WORKER_OPTS=-XX:+UseG1GC -XX:G1HeapRegionSize=8m -XX:MaxGCPauseMillis=200
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_ENDPOINT=http://minio:9000
     command:
       [
         "/opt/spark/bin/spark-class",
         "org.apache.spark.deploy.worker.Worker",
         "spark://spark-master:7077"
       ]
+    ports:
+      - "8082:8082"
     volumes:
-      - ./spark_checkpoints:/opt/spark-checkpoints
-      - ./trainner:/opt/trainner
+      - ./.local/spark/checkpoints:/opt/spark-checkpoints
+      - ./shared/trainner:/opt/trainner
+      - ./.local/spark/work/worker-streaming:/opt/spark/work
+      - ./shared/models:/opt/models
+      - ./infra/spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./.local/spark/ivy_cache:/opt/ivy-cache
     deploy:
-      mode: replicated
-      replicas: 2
       resources:
         limits:
           cpus: '2'
-          memory: 2G
+          memory: 3G  
         reservations:
           cpus: '1'
-          memory: 1G
+          memory: 1536M
+    restart: unless-stopped
+    networks:
+      - fraud-detection
+
+  # Worker cho TRAINING (Airflow → XGBoost Training)
+  spark-worker-training:
+    build: ./infra/spark
+    image: spark:3.5.1
+    platform: linux/amd64
+    container_name: spark-worker-training
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_CORES=2
+
+      - SPARK_WORKER_MEMORY=4g  # Tăng từ 2560m lên 4g
+      
+      - SPARK_WORKER_PORT=8882
+      - SPARK_WORKER_WEBUI_PORT=8083
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+
+      - SPARK_DAEMON_MEMORY=1g  # Tăng từ 512m
+
+      - SPARK_WORKER_OPTS=-XX:+UseG1GC -XX:G1HeapRegionSize=16m -XX:InitiatingHeapOccupancyPercent=35 -XX:MaxGCPauseMillis=200 -XX:+ParallelRefProcEnabled -XX:MaxDirectMemorySize=512m
+      
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_ENDPOINT=http://minio:9000
+    command:
+      [
+        "/opt/spark/bin/spark-class",
+        "org.apache.spark.deploy.worker.Worker",
+        "spark://spark-master:7077"
+      ]
+    ports:
+      - "8083:8083"
+    volumes:
+      - ./.local/spark/checkpoints:/opt/spark-checkpoints
+      - ./shared/trainner:/opt/trainner
+      - ./shared/models:/opt/models
+      - ./.local/spark/work/worker-training:/opt/spark/work
+      - ./infra/spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./.local/spark/ivy_cache:/opt/ivy-cache
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 6G  
+        reservations:
+          cpus: '1'
+          memory: 4G
     restart: unless-stopped
     networks:
       - fraud-detection
@@ -612,7 +715,11 @@ services:
 volumes:
   postgres-db-volume:
     driver: local
-  minio_data:
+  spark-master-work:
+    driver: local
+  spark-worker-streaming-work:
+    driver: local
+  spark-worker-training-work:
     driver: local
 
 # ============================================================================
