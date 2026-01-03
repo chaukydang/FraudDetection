@@ -1,18 +1,12 @@
-xgboost
-mlflow<3
-kafka-python
-python-dotenv
-pyyaml
-catboost
-pyspark==3.5.1
-lightgbm
-imblearn
-pandas
-scikit-learn
-boto3
-tqdm
-tqdm-joblib
+# infra/airflow/requirements.txt
 
-# pins to avoid breaking existing packages in global env
-protobuf>=3.20.3,<6
-numpy<2.2.0
+# Providers hay dùng với Celery + Postgres
+apache-airflow-providers-celery==3.8.2
+apache-airflow-providers-postgres==5.12.0
+
+# Utils (nếu DAG có đọc yaml/env)
+pyyaml==6.0.2
+python-dotenv==1.0.1
+
+# Nếu bạn cần gọi HTTP healthcheck / requests trong custom code
+requests==2.32.3

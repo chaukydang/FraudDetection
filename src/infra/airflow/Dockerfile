@@ -1,20 +1,25 @@
-FROM apache/airflow:2.10.5
+# infra/airflow/Dockerfile
+FROM apache/airflow:2.9.3-python3.11
 
-# Chuyển sang root để tạo thư mục và cài package
 USER root
 
-# Tạo thư mục models và set quyền cho airflow user
-RUN mkdir -p /opt/airflow/models \
-    && chown -R airflow: /opt/airflow/models
+# Cần docker CLI vì bạn dùng BashOperator chạy: docker exec spark-master ...
+# (mount /var/run/docker.sock chỉ đưa socket, không đưa docker client binary)
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      docker.io \
+      curl \
+      ca-certificates \
+    ; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
 
-# Quay lại user airflow
+# Requirements (nếu bạn cần thêm libs cho DAG / operators)
+COPY requirements.txt /requirements.txt
+
 USER airflow
+ENV PATH="/home/airflow/.local/bin:${PATH}"
 
-# Copy file requirements
-COPY requirements.txt /tmp/requirements.txt
-
-# Cài các Python packages
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
-
-# Đảm bảo container chạy với user airflow
-USER airflow
+RUN python -m pip install --no-cache-dir -U pip setuptools wheel && \
+    python -m pip install --no-cache-dir -r /requirements.txt

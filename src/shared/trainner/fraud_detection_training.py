@@ -1,139 +1,128 @@
 import logging
 import os
+from typing import Optional, Dict, Any
+
+import boto3
 import mlflow
 import mlflow.spark
 import yaml
-import boto3
-
 from dotenv import load_dotenv
-from typing import Optional
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, sum as Fsum
-from pyspark.ml import Pipeline
-from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.classification import GBTClassifier
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 
-from pyspark.sql.functions import unix_timestamp
-from pyspark.ml.feature import StringIndexer, OneHotEncoder
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(module)s - %(message)s",
     level=logging.INFO,
-    handlers=[
-        logging.FileHandler('./fraud_detection_model.log'),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()],
 )
-
 logger = logging.getLogger(__name__)
 
 
 class FraudDetectionTraining:
-    def __init__(self, config_path='/opt/config.yaml'):
-        os.environ['GIT_PYTHON_REFRESH'] = 'quiet'
-        os.environ['GIT_PYTHON_GIT_EXECUTABLE'] = '/usr/bin/git'
+    def __init__(self, config_path: str = "/opt/config.yaml"):
+        os.environ["GIT_PYTHON_REFRESH"] = "quiet"
+        os.environ["GIT_PYTHON_GIT_EXECUTABLE"] = "/usr/bin/git"
 
-        load_dotenv(dotenv_path='/opt/.env')
-
+        load_dotenv(dotenv_path="/opt/.env")
         self.config = self._load_config(config_path)
 
-        os.environ.update({
-            'AWS_ACCESS_KEY_ID': os.getenv('AWS_ACCESS_KEY_ID'),
-            'AWS_SECRET_ACCESS_KEY': os.getenv('AWS_SECRET_ACCESS_KEY'),
-            'AWS_S3_ENDPOINT_URL': self.config['mlflow']['s3_endpoint_url']
-        })
+        # MLflow
+        mlflow.set_tracking_uri(self.config["mlflow"]["tracking_uri"])
+        mlflow.set_experiment(self.config["mlflow"]["experiment_name"])
 
-        self._validate_environment()
-
-        mlflow.set_tracking_uri(self.config['mlflow']['tracking_uri'])
-        mlflow.set_experiment(self.config['mlflow']['experiment_name'])
-
-    def _load_config(self, config_path: str) -> dict:
-        try:
-            with open(config_path, 'r') as f:
-                config = yaml.safe_load(f)
-            logger.info('Configuration loaded successfully')
-            return config
-        except Exception as e:
-            logger.error('Failed to load configuration: %s', str(e))
-            raise
-    
-    def _validate_environment(self):
-        required_vars = [
-            'KAFKA_BOOTSTRAP_SERVERS',
-            'KAFKA_USERNAME',
-            'KAFKA_PASSWORD'
-        ]
-        missing = [var for var in required_vars if not os.getenv(var)]
-        if missing:
-            raise ValueError(
-                f'Missing required environment variables: {missing}'
-            )
+        # Ensure MLflow S3 endpoint env exists (some MLflow setups rely on env var)
+        if self.config["mlflow"].get("s3_endpoint_url") and not os.getenv("MLFLOW_S3_ENDPOINT_URL"):
+            os.environ["MLFLOW_S3_ENDPOINT_URL"] = self.config["mlflow"]["s3_endpoint_url"]
 
         self._check_minio_connection()
 
-    def _check_minio_connection(self):
+    def _load_config(self, config_path: str) -> Dict[str, Any]:
+        with open(config_path, "r") as f:
+            return yaml.safe_load(f)
+
+    def _check_minio_connection(self) -> None:
+        """
+        Ensure the MLflow artifact bucket exists in MinIO.
+        """
         try:
             s3 = boto3.client(
-                's3',
-                endpoint_url=self.config['mlflow']['s3_endpoint_url'],
-                aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-                aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
+                "s3",
+                endpoint_url=self.config["mlflow"]["s3_endpoint_url"],
+                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
             )
-
             buckets = s3.list_buckets()
-            bucket_names = [b['Name'] for b in buckets.get('Buckets', [])]
-            logger.info('Minio connection verified. Buckets: %s', bucket_names)
-            
-            mlflow_bucket = self.config['mlflow'].get('bucket', 'mlflow')
-
+            bucket_names = [b["Name"] for b in buckets.get("Buckets", [])]
+            mlflow_bucket = self.config["mlflow"].get("bucket", "mlflow")
             if mlflow_bucket not in bucket_names:
                 s3.create_bucket(Bucket=mlflow_bucket)
-                logger.info('Created missing MLFlow bucket: %s', mlflow_bucket)
-
+                logger.info("Created missing MLflow bucket: %s", mlflow_bucket)
         except Exception as e:
-            logger.error('Minio connection failed: %s', str(e))
+            logger.error("MinIO connection failed: %s", str(e))
             raise
-    
+
+    def _apply_s3a_conf(self, spark: SparkSession) -> None:
+        """
+        Make trainer runnable even outside your Airflow spark_submit wrapper.
+        If wrapper already sets these, this is harmless.
+        """
+        minio = self.config.get("minio", {})
+        if not minio:
+            return
+
+        hconf = spark._jsc.hadoopConfiguration()
+        endpoint = minio.get("endpoint")
+        if endpoint:
+            hconf.set("fs.s3a.endpoint", str(endpoint))
+        hconf.set("fs.s3a.path.style.access", "true")
+        hconf.set("fs.s3a.connection.ssl.enabled", "false")
+        hconf.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        hconf.set("fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+
+        # Prefer env creds (Airflow wrapper / .env)
+        access_key = os.getenv("AWS_ACCESS_KEY_ID", str(minio.get("access_key", "")))
+        secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", str(minio.get("secret_key", "")))
+        if access_key:
+            hconf.set("fs.s3a.access.key", access_key)
+        if secret_key:
+            hconf.set("fs.s3a.secret.key", secret_key)
+
     def _create_spark(self, app_name: str = "fraud_train") -> SparkSession:
         """
-        Tạo SparkSession cho batch training.
-        Nếu bạn chạy bằng spark-submit (recommended) thì các conf s3a endpoint/access/secret
-        nên set ở spark-submit (giống step 6). Ở đây chỉ tạo session.
+        Key fixes:
+        - Use RawLocalFileSystem to avoid generating .crc files when Spark/MLflow writes local tmp
+          (this helps reduce MinIO/urllib3 header parsing warnings seen on ._SUCCESS.crc uploads).
+        - Optionally disable _SUCCESS marker to reduce extra tiny files in model export dirs.
         """
-        spark = (SparkSession.builder
-                 .appName(app_name)
-                 .getOrCreate())
+        builder = (
+            SparkSession.builder.appName(app_name)
+            # Avoid local .crc files
+            .config("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.RawLocalFileSystem")
+            .config("spark.hadoop.fs.file.impl.disable.cache", "true")
+            # Optional: avoid _SUCCESS marker files in some outputs
+            .config("spark.hadoop.mapreduce.fileoutputcommitter.marksuccessfuljobs", "false")
+        )
+
+        spark = builder.getOrCreate()
+
+        # optional log level from config
+        try:
+            lvl = self.config.get("spark", {}).get("log_level", "WARN")
+            spark.sparkContext.setLogLevel(lvl)
+        except Exception:
+            pass
+
+        self._apply_s3a_conf(spark)
         return spark
 
-    def _infer_feature_cols(self, df):
-        drop_cols = {"is_fraud", "label", "transaction_id", "event_ts", "currency", "merchant", "location"}
-        numeric_types = {"int", "bigint", "double", "float", "smallint", "tinyint", "decimal", "long"}
-
-        feature_cols = []
-        for c, t in df.dtypes:
-            if c in drop_cols:
-                continue
-            if any(t.startswith(nt) for nt in numeric_types):
-                feature_cols.append(c)
-
-        # nếu có cột event_ts_unix thì add vào feature
-        if "event_ts_unix" in df.columns:
-            feature_cols.append("event_ts_unix")
-
-        return feature_cols
-
-
     def _compute_scale_pos_weight(self, df) -> float:
-        """
-        scale_pos_weight = (#negative / #positive)
-        giúp XGBoost tốt hơn khi fraud bị lệch lớp.
-        """
         agg = df.select(
             Fsum(col("label")).alias("pos"),
-            Fsum((1 - col("label"))).alias("neg")
+            Fsum((1 - col("label"))).alias("neg"),
         ).collect()[0]
         pos = float(agg["pos"]) if agg["pos"] is not None else 0.0
         neg = float(agg["neg"]) if agg["neg"] is not None else 0.0
@@ -141,70 +130,92 @@ class FraudDetectionTraining:
             return 1.0
         return max(1.0, neg / pos)
 
+    @staticmethod
+    def _normalize_model_type(model_type: str) -> str:
+        m = (model_type or "gbt").lower().strip()
+        if m in ("xgboost", "xgb"):
+            return "xgb"
+        if m in ("gbt", "gbdt"):
+            return "gbt"
+        return m
+
+    def _resolve_xgb_num_workers(self, spark: SparkSession) -> int:
+        """
+        Decide how many distributed workers XGBoost should use.
+
+        Priority:
+        1) ENV: XGB_NUM_WORKERS
+        2) config.yaml: xgb.num_workers
+        3) fallback: spark.defaultParallelism (capped >= 1)
+        """
+        env_val = os.getenv("XGB_NUM_WORKERS")
+        if env_val:
+            try:
+                v = int(env_val)
+                return max(1, v)
+            except Exception:
+                pass
+
+        cfg_val = (self.config.get("xgb") or {}).get("num_workers")
+        if cfg_val is not None:
+            try:
+                v = int(cfg_val)
+                return max(1, v)
+            except Exception:
+                pass
+
+        try:
+            v = int(spark.sparkContext.defaultParallelism)
+            return max(1, v)
+        except Exception:
+            return 1
+
     def train_model(
         self,
         input_path: str,
-        model_type: str = "gbt",   # "gbt" | "xgb"
+        model_type: str = "gbt",
         run_name: Optional[str] = None,
-        seed: int = 42
-    ):
-        """
-        Train model từ parquet features (step 6) + log lên MLflow.
-        """
+        seed: int = 42,
+    ) -> Dict[str, Any]:
+        model_type = self._normalize_model_type(model_type)
         spark = self._create_spark(app_name=f"train_{model_type}")
 
         try:
             df = spark.read.parquet(input_path)
-            df = df.dropna(subset=["is_fraud"])
-            df = df.withColumn("label", col("is_fraud").cast("double"))
 
-            # timestamp -> numeric
-            if "event_ts" in df.columns:
-                df = df.withColumn("event_ts_unix", unix_timestamp(col("event_ts")).cast("double"))
+            # Expect GOLD schema: label + features
+            if "label" not in df.columns and "is_fraud" in df.columns:
+                df = df.withColumn("label", col("is_fraud").cast("double"))
 
-            # categorical encoding
-            cat_cols = [c for c in ["currency", "merchant", "location"] if c in df.columns]
+            if "features" not in df.columns:
+                raise RuntimeError(
+                    "Input dataset must contain 'features' column (vector). Use build_features.py first."
+                )
 
-            indexers = [
-                StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="keep")
-                for c in cat_cols
-            ]
-            encoders = [
-                OneHotEncoder(inputCol=f"{c}_idx", outputCol=f"{c}_ohe", handleInvalid="keep")
-                for c in cat_cols
-            ]
+            df = df.dropna(subset=["label", "features"])
 
-            # numeric feature cols
-            numeric_cols = self._infer_feature_cols(df)
-
-            # final features = numeric + ohe vectors
-            final_feature_cols = numeric_cols + [f"{c}_ohe" for c in cat_cols]
-
-            assembler = VectorAssembler(
-                inputCols=final_feature_cols,
-                outputCol="features",
-                handleInvalid="keep"
-            )
-
-            # split đơn giản (nếu bạn có event_time thì nên split theo time để tránh leakage)
             train_df, test_df = df.randomSplit([0.8, 0.2], seed=seed)
 
             evaluator_roc = BinaryClassificationEvaluator(
-                labelCol="label", rawPredictionCol="rawPrediction", metricName="areaUnderROC"
+                labelCol="label",
+                rawPredictionCol="rawPrediction",
+                metricName="areaUnderROC",
             )
             evaluator_pr = BinaryClassificationEvaluator(
-                labelCol="label", rawPredictionCol="rawPrediction", metricName="areaUnderPR"
+                labelCol="label",
+                rawPredictionCol="rawPrediction",
+                metricName="areaUnderPR",
             )
 
             if run_name is None:
-                run_name = f"{model_type.upper()}_{os.path.basename(input_path).replace('=', '-')}"  # nhẹ nhàng thôi
+                run_name = f"{model_type.upper()}_daily"
 
             with mlflow.start_run(run_name=run_name):
                 mlflow.log_param("model_type", model_type)
                 mlflow.log_param("input_path", input_path)
-                mlflow.log_param("num_features", len(feature_cols))
+                mlflow.log_param("seed", seed)
 
-                if model_type.lower() == "gbt":
+                if model_type == "gbt":
                     clf = GBTClassifier(
                         labelCol="label",
                         featuresCol="features",
@@ -212,62 +223,62 @@ class FraudDetectionTraining:
                         maxDepth=6,
                         stepSize=0.1,
                         subsamplingRate=0.8,
-                        seed=seed
+                        seed=seed,
                     )
-                    mlflow.log_param("maxIter", 120)
-                    mlflow.log_param("maxDepth", 6)
-                    mlflow.log_param("stepSize", 0.1)
-                    mlflow.log_param("subsamplingRate", 0.8)
+                    model = clf.fit(train_df)
 
-                    pipe = Pipeline(stages=indexers + encoders + [assembler, clf])
-                    model = pipe.fit(train_df)
-
-                elif model_type.lower() == "xgb":
+                elif model_type == "xgb":
                     from xgboost.spark import SparkXGBClassifier
 
-                    # chạy stages encode + assembler trước
-                    prep = Pipeline(stages=indexers + encoders + [assembler]).fit(df)
-                    df2 = prep.transform(df).select("features", "label")
-
-                    train2, test2 = df2.randomSplit([0.8, 0.2], seed=seed)
-
-                    spw = self._compute_scale_pos_weight(train2)
+                    spw = self._compute_scale_pos_weight(train_df)
                     mlflow.log_param("scale_pos_weight", spw)
 
-                    model = SparkXGBClassifier(
+                    num_workers = self._resolve_xgb_num_workers(spark)
+                    mlflow.log_param("num_workers", num_workers)
+
+                    # NOTE: SparkXGBClassifier does NOT allow setting custom 'objective'
+                    xgb = SparkXGBClassifier(
                         features_col="features",
                         label_col="label",
-                        objective="binary:logistic",
+                        prediction_col="prediction",
+                        probability_col="probability",
+                        raw_prediction_col="rawPrediction",
                         eval_metric="aucpr",
-                        num_round=400,
+                        # distributed workers
+                        num_workers=num_workers,
+                        # training params
+                        num_round=300,
                         max_depth=6,
                         eta=0.08,
                         subsample=0.8,
                         colsample_bytree=0.8,
                         reg_lambda=1.0,
                         scale_pos_weight=spw,
-                        seed=seed
-                    ).fit(train2)
-
-                    test_df = test2
-
+                        seed=seed,
+                        # optionally control per-worker threads if needed
+                        nthread=1,
+                    )
+                    model = xgb.fit(train_df)
 
                 else:
-                    raise ValueError("model_type chỉ nhận 'gbt' hoặc 'xgb'")
+                    raise ValueError("model_type chỉ nhận 'gbt' hoặc 'xgb/xgboost'")
 
                 pred = model.transform(test_df)
-
                 auc_roc = float(evaluator_roc.evaluate(pred))
                 auc_pr = float(evaluator_pr.evaluate(pred))
 
                 mlflow.log_metric("auc_roc", auc_roc)
                 mlflow.log_metric("auc_pr", auc_pr)
 
-                # log Spark model artifact
+                # Logging model to MLflow
                 mlflow.spark.log_model(model, artifact_path="model")
 
-                logger.info("[OK] Train done. model=%s auc_roc=%.6f auc_pr=%.6f",
-                            model_type, auc_roc, auc_pr)
+                logger.info(
+                    "[OK] Train done. model=%s auc_roc=%.6f auc_pr=%.6f",
+                    model_type,
+                    auc_roc,
+                    auc_pr,
+                )
 
                 return {"auc_roc": auc_roc, "auc_pr": auc_pr, "run_name": run_name}
 

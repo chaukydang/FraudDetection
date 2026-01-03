@@ -1,62 +1,81 @@
-from datetime import datetime, timedelta, timezone
 import json
+import logging
 import os
 import random
 import signal
 import time
-from typing import Optional, Dict, Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
 from confluent_kafka import Producer
 from dotenv import load_dotenv
-import logging
 from faker import Faker
 from jsonschema import validate as js_validate, ValidationError, FormatChecker
 
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(module)s - %(message)s",
-    level=logging.INFO
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("transaction-producer")
 
-load_dotenv(dotenv_path="/app/.env")
+# -----------------------------------------------------------------------------
+# Env
+# -----------------------------------------------------------------------------
+# In container: keep /app/.env as you did; if not found, dotenv just won't fail.
+load_dotenv(dotenv_path=os.getenv("DOTENV_PATH", "/app/.env"))
 
 fake = Faker()
 
 TRANSACTION_SCHEMA = {
     "type": "object",
     "properties": {
+        "schema_version": {"type": "integer"},
         "transaction_id": {"type": "string"},
-        "user_id": {"type": "number", "minimum": 1000, "maximum": 9999},
+        "user_id": {"type": "integer", "minimum": 1000, "maximum": 9999},
         "amount": {"type": "number", "minimum": 0.01, "maximum": 10000},
         "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
         "merchant": {"type": "string"},
-        "timestamp": {"type": "string", "format": "date-time"},
+        "timestamp": {"type": "string", "format": "date-time"},   # event_time
+        "producer_ts": {"type": "string", "format": "date-time"}, # emit time
+        "source_id": {"type": "string"},
         "location": {"type": "string", "pattern": "^[A-Z]{2}$"},
         "is_fraud": {"type": "integer", "minimum": 0, "maximum": 1},
     },
-    "required": ["transaction_id", "user_id", "amount", "currency", "timestamp", "is_fraud"],
+    "required": [
+        "schema_version",
+        "transaction_id",
+        "user_id",
+        "amount",
+        "currency",
+        "timestamp",
+        "producer_ts",
+        "source_id",
+        "is_fraud",
+    ],
 }
 
 
 class TransactionProducer:
-    def __init__(self):
-        self.bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-        self.kafka_username = os.getenv("KAFKA_USERNAME")
-        self.kafka_password = os.getenv("KAFKA_PASSWORD")
+    def __init__(self) -> None:
+        # -----------------------------
+        # Runtime knobs
+        # -----------------------------
         self.topic = os.getenv("KAFKA_TOPIC", "transactions")
         self.running = False
 
-        # ---------- runtime knobs (reduce CPU / control throughput) ----------
-        self.enable_validate = os.getenv("ENABLE_VALIDATE", "0") == "1"  # default OFF
-        self.validate_every_n = int(os.getenv("VALIDATE_EVERY_N", "200"))  # validate 1/N msgs
-        self.log_every_n = int(os.getenv("LOG_EVERY_N", "500"))  # log 1/N delivered msgs
+        self.enable_validate = os.getenv("ENABLE_VALIDATE", "0") == "1"
+        self.validate_every_n = int(os.getenv("VALIDATE_EVERY_N", "200"))
 
-        # Batch loop controls (giảm CPU + giảm tốn pin)
-        self.batch_messages = int(os.getenv("BATCH_MESSAGES", "500"))
-        self.batch_sleep_sec = float(os.getenv("BATCH_SLEEP_SEC", "0.5"))
+        self.batch_messages = int(os.getenv("BATCH_MESSAGES", "400"))
+        self.batch_sleep_sec = float(os.getenv("BATCH_SLEEP_SEC", "0.6"))
         self.poll_timeout_sec = float(os.getenv("POLL_TIMEOUT_SEC", "0.2"))
 
-        # Optional: dùng merchant list để giảm CPU (Faker company() khá nặng)
+        self.log_every_n = int(os.getenv("LOG_EVERY_N", "2000"))
+        self.max_buffer_retries = int(os.getenv("PRODUCER_BUFFER_RETRIES", "5"))
+
         self.use_fast_merchants = os.getenv("FAST_MERCHANTS", "1") == "1"
         self.merchants = [
             "Amazon", "Walmart", "Target", "Apple", "Netflix",
@@ -64,190 +83,207 @@ class TransactionProducer:
             "QuickCash", "GlobalDigital", "FastMoneyX"
         ]
 
-        # ---------- Kafka producer config ----------
-        self.producer_config = {
-            "bootstrap.servers": self.bootstrap_servers,
-            "client.id": "transaction-producer",
+        # -----------------------------
+        # Kafka (Confluent Cloud)
+        # -----------------------------
+        bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "")
+        username = os.getenv("KAFKA_USERNAME", "")
+        password = os.getenv("KAFKA_PASSWORD", "")
 
-            # Snappy/LZ4 nhẹ CPU hơn gzip
+        if not bootstrap:
+            raise ValueError("Missing KAFKA_BOOTSTRAP_SERVERS")
+
+        # Baseline: safe delivery (idempotent + acks=all)
+        cfg: Dict[str, Any] = {
+            "bootstrap.servers": bootstrap,
+            "client.id": os.getenv("KAFKA_CLIENT_ID", "transaction-producer"),
+
+            # batching / perf
             "compression.type": os.getenv("KAFKA_COMPRESSION", "snappy"),
-
-            # Batch tuning (giảm network/CPU)
             "linger.ms": int(os.getenv("KAFKA_LINGER_MS", "20")),
-            "batch.size": int(os.getenv("KAFKA_BATCH_SIZE", "65536")),  # bytes
+            "batch.size": int(os.getenv("KAFKA_BATCH_SIZE", "65536")),
+            "queue.buffering.max.kbytes": int(os.getenv("KAFKA_QUEUE_KB", "10240")),
 
-            # Tránh queue phình vô hạn khi downstream chậm
-            "queue.buffering.max.kbytes": int(os.getenv("KAFKA_QUEUE_KB", "10240")),  # 10MB
-            "message.send.max.retries": int(os.getenv("KAFKA_RETRIES", "3")),
+            # delivery semantics
+            "enable.idempotence": os.getenv("KAFKA_ENABLE_IDEMPOTENCE", "true").lower() == "true",
+            "acks": os.getenv("KAFKA_ACKS", "all"),
+            "retries": int(os.getenv("KAFKA_RETRIES", "2147483647")),
             "retry.backoff.ms": int(os.getenv("KAFKA_RETRY_BACKOFF_MS", "200")),
-            
-            # Keepalive & Timeout (FIX SSL issues)
-            "connections.max.idle.ms": int(os.getenv("KAFKA_CONNECTIONS_MAX_IDLE_MS", "540000")),
-            "socket.keepalive.enable": os.getenv("KAFKA_SOCKET_KEEPALIVE", "True") == "True",
-            "heartbeat.interval.ms": int(os.getenv("KAFKA_HEARTBEAT_INTERVAL_MS", "3000")),
-            "session.timeout.ms": int(os.getenv("KAFKA_SESSION_TIMEOUT_MS", "45000")),
-            "max.poll.interval.ms": int(os.getenv("KAFKA_MAX_POLL_INTERVAL_MS", "300000")),
-            "retries": int(os.getenv("KAFKA_MAX_RETRIES", "2147483647")),
-            "reconnect.backoff.ms": int(os.getenv("KAFKA_RECONNECT_BACKOFF_MS", "50")),
-            "reconnect.backoff.max.ms": int(os.getenv("KAFKA_RECONNECT_BACKOFF_MAX_MS", "1000")),
+            "max.in.flight.requests.per.connection": int(os.getenv("KAFKA_MAX_INFLIGHT", "5")),
+
+            # timeouts
             "request.timeout.ms": int(os.getenv("KAFKA_REQUEST_TIMEOUT_MS", "30000")),
             "delivery.timeout.ms": int(os.getenv("KAFKA_DELIVERY_TIMEOUT_MS", "120000")),
+
+            # keepalive
+            "connections.max.idle.ms": int(os.getenv("KAFKA_CONNECTIONS_MAX_IDLE_MS", "540000")),
+            "socket.keepalive.enable": os.getenv("KAFKA_SOCKET_KEEPALIVE", "True") == "True",
         }
 
-        if self.kafka_username and self.kafka_password:
-            # NOTE: nếu broker confluent cloud / SASL_SSL
-            self.producer_config.update({
-                "security.protocol": os.getenv("KAFKA_SECURITY_PROTOCOL", "SASL_SSL"),
-                "sasl.mechanism": os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
-                "sasl.username": self.kafka_username,
-                "sasl.password": self.kafka_password,
-            })
-        else:
-            self.producer_config["security.protocol"] = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+        # Confluent Cloud requires SASL_SSL
+        # (You can keep env defaults you already have.)
+        cfg.update({
+            "security.protocol": os.getenv("KAFKA_SECURITY_PROTOCOL", "SASL_SSL"),
+            "sasl.mechanism": os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
+            "sasl.username": username,
+            "sasl.password": password,
+        })
 
-        try:
-            self.producer = Producer(self.producer_config)
-            logger.info("Kafka Producer initialized successfully.")
-        except Exception as e:
-            logger.error(f"Failed to initialize Kafka Producer: {e}")
-            raise
+        # Validate required auth fields for Confluent Cloud
+        if not username or not password:
+            raise ValueError("Missing KAFKA_USERNAME / KAFKA_PASSWORD for Confluent Cloud")
+
+        self.producer = Producer(cfg)
+        logger.info("Kafka Producer initialized. topic=%s bootstrap=%s", self.topic, bootstrap)
 
         # Fraud simulation params
         self.compromised_users = set(random.sample(range(1000, 9999), k=50))
         self.high_risk_merchants = ["QuickCash", "GlobalDigital", "FastMoneyX"]
 
         # Counters
-        self._delivered_count = 0
         self._produced_count = 0
+        self._delivered_count = 0
 
         # Graceful shutdown
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGTERM, self.shutdown)
 
-    def generate_transaction(self) -> Optional[Dict[str, Any]]:
+    # -------------------------------------------------------------------------
+    # Generate / validate
+    # -------------------------------------------------------------------------
+    def _make_transaction(self) -> Dict[str, Any]:
         merchant = random.choice(self.merchants) if self.use_fast_merchants else fake.company()
 
-        transaction = {
+        now = datetime.now(timezone.utc)
+        # Keep event time mostly around "now" (avoid too much future time)
+        event_time = (now + timedelta(seconds=random.randint(-300, 30))).isoformat()
+
+        tx: Dict[str, Any] = {
+            "schema_version": 1,
             "transaction_id": fake.uuid4(),
             "user_id": random.randint(1000, 9999),
             "amount": round(fake.pyfloat(min_value=0.01, max_value=10000), 2),
             "currency": "USD",
             "merchant": merchant,
-            "timestamp": (
-                datetime.now(timezone.utc) + timedelta(seconds=random.randint(-300, 3000))
-            ).isoformat(),
+            "timestamp": event_time,         # event_time
+            "producer_ts": now.isoformat(),  # emit time
+            "source_id": os.getenv("HOSTNAME", "producer"),
             "location": fake.country_code(),
             "is_fraud": 0,
         }
 
+        # Fraud simulation
         is_fraud = 0
-        amount = transaction["amount"]
-        user_id = transaction["user_id"]
-        merchant = transaction["merchant"]
+        amount = tx["amount"]
+        user_id = tx["user_id"]
 
         # Account takeover
-        if user_id in self.compromised_users and amount > 500:
-            if random.random() < 0.3:
-                is_fraud = 1
-                transaction["amount"] = round(random.uniform(500, 5000), 2)
-                transaction["merchant"] = random.choice(self.high_risk_merchants)
+        if user_id in self.compromised_users and amount > 500 and random.random() < 0.3:
+            is_fraud = 1
+            tx["amount"] = round(random.uniform(500, 5000), 2)
+            tx["merchant"] = random.choice(self.high_risk_merchants)
 
         # Card testing
-        if not is_fraud and amount < 2.0:
-            if user_id % 1000 == 0 and random.random() < 0.25:
-                is_fraud = 1
-                transaction["amount"] = round(random.uniform(0.01, 2), 2)
-                transaction["location"] = "US"
+        if not is_fraud and amount < 2.0 and user_id % 1000 == 0 and random.random() < 0.25:
+            is_fraud = 1
+            tx["amount"] = round(random.uniform(0.01, 2), 2)
+            tx["location"] = "US"
 
         # Merchant collusion
-        if not is_fraud and merchant in self.high_risk_merchants:
-            if amount > 3000 and random.random() < 0.15:
-                is_fraud = 1
-                transaction["amount"] = round(random.uniform(300, 1500), 2)
+        if not is_fraud and tx["merchant"] in self.high_risk_merchants and amount > 3000 and random.random() < 0.15:
+            is_fraud = 1
+            tx["amount"] = round(random.uniform(300, 1500), 2)
 
         # Geographic anomalies
-        if not is_fraud:
-            if user_id % 500 == 0 and random.random() < 0.1:
-                is_fraud = 1
-                transaction["location"] = random.choice(["CN", "RU", "GB"])
+        if not is_fraud and user_id % 500 == 0 and random.random() < 0.1:
+            is_fraud = 1
+            tx["location"] = random.choice(["CN", "RU", "GB"])
 
         # Baseline random fraud
         if not is_fraud and random.random() < 0.002:
             is_fraud = 1
-            transaction["amount"] = round(random.uniform(100, 2000), 2)
+            tx["amount"] = round(random.uniform(100, 2000), 2)
 
-        # final fraud rate clamp-ish
-        transaction["is_fraud"] = is_fraud if random.random() < 0.985 else 0
+        tx["is_fraud"] = 1 if (is_fraud and random.random() < 0.985) else 0
+        return tx
 
-        if self.validate_transaction(transaction):
-            return transaction
-        return None
-
-    def validate_transaction(self, transaction: Dict[str, Any]) -> bool:
-        # Fast path: tắt validate hoặc validate theo tỉ lệ 1/N để giảm CPU
+    def _validate(self, tx: Dict[str, Any]) -> bool:
         if not self.enable_validate:
             return True
-
         if self.validate_every_n > 1 and (self._produced_count % self.validate_every_n != 0):
             return True
-
         try:
-            js_validate(instance=transaction, schema=TRANSACTION_SCHEMA, format_checker=FormatChecker())
+            js_validate(instance=tx, schema=TRANSACTION_SCHEMA, format_checker=FormatChecker())
             return True
         except ValidationError as e:
-            logger.error(f"Invalid transaction: {e.message}")
+            logger.error("Invalid transaction: %s", e.message)
             return False
 
-    def delivery_report(self, err, msg):
+    def generate_transaction(self) -> Optional[Dict[str, Any]]:
+        tx = self._make_transaction()
+        return tx if self._validate(tx) else None
+
+    # -------------------------------------------------------------------------
+    # Kafka send
+    # -------------------------------------------------------------------------
+    def delivery_report(self, err, msg) -> None:
         if err is not None:
-            # Log chi tiết hơn để debug
-            logger.error(f"Message delivery failed: {err} | Key: {msg.key()}")
-            
-            # Nếu là network error, có thể cần reconnect
-            if "Disconnected" in str(err) or "SSL" in str(err):
-                logger.warning("Network/SSL error detected. Producer will auto-reconnect.")
+            logger.error("Delivery failed: %s topic=%s key=%s", err, msg.topic(), msg.key())
             return
 
         self._delivered_count += 1
         if self._delivered_count % self.log_every_n == 0:
-            logger.info(f"Delivered {self._delivered_count} msgs. Last: {msg.topic()}[{msg.partition()}]")
+            logger.info(
+                "Delivered=%d produced=%d last=%s[%d] key=%s",
+                self._delivered_count,
+                self._produced_count,
+                msg.topic(),
+                msg.partition(),
+                msg.key(),
+            )
+
+    def _produce_with_backpressure(self, key: bytes, value: bytes) -> bool:
+        """
+        Avoid data loss:
+        - If local queue is full, poll + retry a few times instead of dropping.
+        """
+        for attempt in range(self.max_buffer_retries + 1):
+            try:
+                self.producer.produce(self.topic, key=key, value=value, callback=self.delivery_report)
+                return True
+            except BufferError:
+                # Let librdkafka deliver queued messages and free up space
+                self.producer.poll(self.poll_timeout_sec)
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            except Exception as e:
+                logger.exception("Produce exception: %s", e)
+                return False
+
+        logger.warning("Queue still full after retries; backing off")
+        time.sleep(0.2)
+        return False
 
     def send_transaction(self) -> bool:
-        """
-        IMPORTANT:
-          - KHÔNG poll() mỗi message (giảm CPU)
-          - Nếu queue full -> poll nhẹ rồi skip
-        """
-        transaction = self.generate_transaction()
-        if not transaction:
+        tx = self.generate_transaction()
+        if not tx:
             return False
 
-        try:
-            self.producer.produce(
-                self.topic,
-                key=transaction["transaction_id"],
-                value=json.dumps(transaction),
-                callback=self.delivery_report,
-            )
+        # Key by user_id for better per-user ordering/state in Spark
+        key = str(tx["user_id"]).encode("utf-8")
+        value = json.dumps(tx, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+        ok = self._produce_with_backpressure(key, value)
+        if ok:
             self._produced_count += 1
-            return True
+        return ok
 
-        except BufferError:
-            # Producer queue đầy: poll để giải phóng callback/queue, rồi thử lại ở batch sau
-            self.producer.poll(self.poll_timeout_sec)
-            return False
-
-        except Exception as e:
-            logger.error(f"Failed to send transaction: {e}")
-            return False
-
-    def run_continuous_production(self):
-        """
-        Batch produce -> poll theo batch -> sleep
-        => Giảm CPU/battery rõ rệt
-        """
+    # -------------------------------------------------------------------------
+    # Loop / shutdown
+    # -------------------------------------------------------------------------
+    def run(self) -> None:
         self.running = True
-        logger.info("Starting producer for topic %s...", self.topic)
+        logger.info("Starting production loop. topic=%s", self.topic)
 
         try:
             while self.running:
@@ -256,27 +292,29 @@ class TransactionProducer:
                         break
                     self.send_transaction()
 
-                # Poll có timeout để xử lý delivery callbacks (đỡ busy loop)
+                # process delivery callbacks
                 self.producer.poll(self.poll_timeout_sec)
 
-                # Sleep để giới hạn throughput và giảm tải
+                # throttle
                 if self.batch_sleep_sec > 0:
                     time.sleep(self.batch_sleep_sec)
 
         finally:
             self.shutdown()
 
-    def shutdown(self, signum=None, frame=None):
-        if self.running:
-            logger.info("Initiating shutdown...")
-            self.running = False
-            try:
-                self.producer.flush(timeout=30)
-            except Exception:
-                pass
-            logger.info("Producer stopped")
+    def shutdown(self, signum=None, frame=None) -> None:
+        if not self.running:
+            return
+        logger.info("Shutting down...")
+        self.running = False
+        try:
+            remaining = self.producer.flush(timeout=30)
+            if remaining:
+                logger.warning("Flush timeout; remaining messages=%s", remaining)
+        except Exception:
+            pass
+        logger.info("Producer stopped.")
 
 
 if __name__ == "__main__":
-    producer = TransactionProducer()
-    producer.run_continuous_production()
+    TransactionProducer().run()
