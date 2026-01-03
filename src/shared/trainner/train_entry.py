@@ -60,13 +60,16 @@ def main():
 
     finally:
         logger.info("Exiting with code %d", exit_code)
-        
-        # Flush all outputs
-        sys.stdout.flush()
-        sys.stderr.flush()
-        
-        # Force immediate exit without cleanup - kills everything including JVM
-        raise SystemExit(exit_code)
+
+        # Flush before hard-exit
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+        # HARD EXIT: tránh bị treo do non-daemon threads (PySpark/MLflow/boto3/xgboost...)
+        os._exit(exit_code)
 
 
 if __name__ == "__main__":

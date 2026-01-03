@@ -143,8 +143,8 @@ services:
     container_name: airflow-worker
     command: celery worker
     restart: always
-    mem_limit: 2g
-    cpus: 1.0
+    mem_limit: 4g
+    cpus: 2.0
     depends_on:
       airflow-webserver:
         condition: service_healthy
