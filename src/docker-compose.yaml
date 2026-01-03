@@ -1,5 +1,3 @@
-version: "3.8"
-
 x-airflow-common: &airflow-common
   build: ./infra/airflow
   image: airflow-training:latest
@@ -7,12 +5,9 @@ x-airflow-common: &airflow-common
     - ${ENV_FILE_PATH:-.env}
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
-    AIRFLOW__CORE__FERNET_KEY: ''
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-
-    AIRFLOW__WEBSERVER__SECRET_KEY: "${AIRFLOW_WEBSERVER_SECRET_KEY}"
-    TZ: "Asia/Ho_Chi_Minh"
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
 
     # ---- Laptop mode ----
     AIRFLOW__CORE__PARALLELISM: 8
@@ -29,8 +24,14 @@ x-airflow-common: &airflow-common
     AIRFLOW__SCHEDULER__PARSING_PROCESSES: 1
     AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
 
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+
     MLFLOW_TRACKING_URI: "http://mlflow-server:5500"
     MLFLOW_S3_ENDPOINT_URL: "http://minio:9000"
+
+    # ✅ keep region consistent across all containers
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+
     PYTHONPATH: "/opt/airflow:/opt"
     PATH: "/home/airflow/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
@@ -45,9 +46,6 @@ x-airflow-common: &airflow-common
     - ./shared/trainner:/opt/trainner
     - ./apps/spark_jobs:/opt/jobs
     - /var/run/docker.sock:/var/run/docker.sock
-
-    - /etc/localtime:/etc/localtime:ro
-    - /etc/timezone:/etc/timezone:ro
 
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
@@ -66,7 +64,6 @@ services:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
-      # ✅ Đảm bảo postgres init script có thể tạo DB khác (mlflow) nếu script của bạn dùng psql
       POSTGRES_HOST_AUTH_METHOD: trust
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
@@ -169,7 +166,6 @@ services:
     networks:
       - fraud-detection
 
-  # ✅ Airflow init: thêm reset logic option bằng env AIRFLOW_DB_RESET=true
   airflow-init:
     <<: *airflow-common
     container_name: airflow-init
@@ -196,7 +192,7 @@ services:
           --firstname Airflow --lastname Admin --role Admin --email admin@example.com || true
     environment:
       <<: *airflow-common-env
-      _PIP_ADDITIONAL_REQUIREMENTS: ''
+      _PIP_ADDITIONAL_REQUIREMENTS: ""
       AIRFLOW_DB_RESET: ${AIRFLOW_DB_RESET:-false}
     user: "0:0"
     restart: "no"
@@ -212,7 +208,6 @@ services:
       - "9001:9001"
     command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
     environment:
-      # ✅ MUST match what Spark/Airflow/mlflow/mc are using
       MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID}
       MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY}
     volumes:
@@ -266,7 +261,7 @@ services:
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-    # FIX: Remove --allowed-hosts (not supported in MLflow 2.16.2)
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
     command: >
       mlflow server
       --host 0.0.0.0
@@ -296,7 +291,6 @@ services:
     networks:
       - fraud-detection
 
-  # ✅ Spark Master
   spark-master:
     build: ./infra/spark
     image: spark-custom:3.5.1
@@ -310,11 +304,11 @@ services:
       SPARK_DAEMON_MEMORY: 512m
       SPARK_WORKER_TIMEOUT: 600
       SPARK_NETWORK_TIMEOUT: 600s
-      # ✅ tăng timeout worker ở master
       SPARK_MASTER_OPTS: "-Dspark.worker.timeout=600"
 
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
       S3_ENDPOINT: http://minio:9000
     volumes:
       - ./apps/spark_jobs:/opt/jobs
@@ -322,7 +316,6 @@ services:
       - ./shared/models:/opt/models
       - ./shared/config.yaml:/opt/config.yaml
       - ./.local/spark/checkpoints:/opt/spark-checkpoints
-      # ✅ Ivy cache dùng chung + writable
       - ./.local/spark/ivy_cache:/opt/ivy-cache
       - ./infra/spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
     healthcheck:
@@ -337,7 +330,6 @@ services:
     networks:
       - fraud-detection
 
-  # ✅ Spark Worker
   spark-worker:
     image: spark-custom:3.5.1
     container_name: spark-worker
@@ -352,17 +344,16 @@ services:
       SPARK_DAEMON_MEMORY: 512m
       SPARK_NETWORK_TIMEOUT: 600s
       SPARK_EXECUTOR_HEARTBEAT_INTERVAL: 30s
-      # ✅ giúp tránh remove worker khi laptop sleep/lag
       SPARK_WORKER_OPTS: "-Dspark.worker.timeout=600"
 
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
       S3_ENDPOINT: http://minio:9000
     volumes:
       - ./shared/models:/opt/models
       - ./shared/config.yaml:/opt/config.yaml
       - ./.local/spark/checkpoints:/opt/spark-checkpoints
-      # ✅ Ivy cache dùng chung + writable
       - ./.local/spark/ivy_cache:/opt/ivy-cache
       - ./infra/spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
     restart: unless-stopped
@@ -371,7 +362,6 @@ services:
     networks:
       - fraud-detection
 
-  # ✅ Streaming service: Kafka -> Bronze (MinIO)
   spark-stream-kafka-to-minio:
     image: spark-custom:3.5.1
     container_name: spark-stream-kafka-to-minio
@@ -384,6 +374,7 @@ services:
     environment:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
       S3_ENDPOINT: http://minio:9000
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
       KAFKA_USERNAME: ${KAFKA_USERNAME}
@@ -394,10 +385,8 @@ services:
         "--master", "spark://spark-master:7077",
         "--deploy-mode", "client",
 
-        # ✅ FIX Ivy cache (điểm chết của bạn)
         "--conf", "spark.jars.ivy=/opt/ivy-cache",
 
-        # GIỚI HẠN RESOURCE CHO STREAMING (QUAN TRỌNG)
         "--conf", "spark.cores.max=1",
         "--conf", "spark.executor.instances=1",
         "--conf", "spark.executor.cores=1",
@@ -413,7 +402,6 @@ services:
       - ./apps/spark_jobs:/opt/jobs
       - ./shared/config.yaml:/opt/config.yaml
       - ./.local/spark/checkpoints:/opt/spark-checkpoints
-      # ✅ Ivy cache mount + writable
       - ./.local/spark/ivy_cache:/opt/ivy-cache
       - ./infra/spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
     restart: unless-stopped
