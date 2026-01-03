@@ -1,3 +1,4 @@
+# apps/airflow/dags/fraud_pipeline_daily.py
 from datetime import datetime, timedelta
 
 from airflow import DAG
@@ -14,28 +15,25 @@ DEFAULT_ARGS = {
 SPARK_WRAPPER = r"""
 set -euo pipefail
 
-# Load shared env (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY,...)
+# Load shared env
 set -a
 source /opt/.env
 set +a
 
 SPARK_MASTER_CONTAINER="${SPARK_MASTER_CONTAINER:-spark-master}"
 
-# Allow overriding Spark sizing from Airflow env (optional)
-SPARK_EXECUTOR_INSTANCES="${SPARK_EXECUTOR_INSTANCES:-3}"
-SPARK_EXECUTOR_CORES="${SPARK_EXECUTOR_CORES:-1}"
-SPARK_EXECUTOR_MEMORY="${SPARK_EXECUTOR_MEMORY:-2g}"
-SPARK_DRIVER_MEMORY="${SPARK_DRIVER_MEMORY:-1g}"
-
-# For XGBoost distributed workers (default = executor instances)
-XGB_NUM_WORKERS="${XGB_NUM_WORKERS:-${SPARK_EXECUTOR_INSTANCES}}"
-
-# pull minio endpoint from config
+# Pull minio endpoint from config
 MINIO_ENDPOINT="$(docker exec "${SPARK_MASTER_CONTAINER}" bash -lc 'python - <<PY
 import yaml
 cfg=yaml.safe_load(open("/opt/config.yaml"))
 print(cfg["minio"]["endpoint"])
 PY')"
+
+# MLflow/MinIO env
+export MLFLOW_S3_ENDPOINT_URL="${MINIO_ENDPOINT}"
+export AWS_EC2_METADATA_DISABLED="true"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+export AWS_REGION="${AWS_REGION:-us-east-1}"
 
 spark_submit () {
   local app="$1"; shift
@@ -43,27 +41,30 @@ spark_submit () {
   docker exec \
     -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \
     -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \
-    -e MLFLOW_S3_ENDPOINT_URL="http://minio:9000" \
-    -e XGB_NUM_WORKERS="${XGB_NUM_WORKERS}" \
+    -e AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}" \
+    -e AWS_REGION="${AWS_REGION:-us-east-1}" \
+    -e AWS_EC2_METADATA_DISABLED="true" \
+    -e MLFLOW_S3_ENDPOINT_URL="${MINIO_ENDPOINT}" \
     "${SPARK_MASTER_CONTAINER}" \
     /opt/spark/bin/spark-submit \
       --master spark://spark-master:7077 \
       --deploy-mode client \
-      \
-      --conf spark.dynamicAllocation.enabled=false \
-      --conf spark.executor.instances="${SPARK_EXECUTOR_INSTANCES}" \
-      --conf spark.executor.cores="${SPARK_EXECUTOR_CORES}" \
-      --conf spark.executor.memory="${SPARK_EXECUTOR_MEMORY}" \
-      --conf spark.driver.memory="${SPARK_DRIVER_MEMORY}" \
-      --conf spark.cores.max="$((SPARK_EXECUTOR_INSTANCES * SPARK_EXECUTOR_CORES))" \
-      --total-executor-cores "$((SPARK_EXECUTOR_INSTANCES * SPARK_EXECUTOR_CORES))" \
-      \
-      --conf spark.sql.shuffle.partitions=8 \
+      --conf spark.jars.ivy=/opt/ivy-cache \
+      --conf spark.network.timeout=600s \
+      --conf spark.executor.heartbeatInterval=30s \
+      --conf spark.executor.instances=1 \
+      --conf spark.executor.cores=1 \
+      --conf spark.executor.memory=2g \
+      --conf spark.driver.memory=1g \
+      --conf spark.sql.shuffle.partitions=4 \
       --conf spark.sql.sources.partitionOverwriteMode=dynamic \
       \
       --conf spark.executorEnv.AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \
       --conf spark.executorEnv.AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \
-      --conf spark.executorEnv.XGB_NUM_WORKERS="${XGB_NUM_WORKERS}" \
+      --conf spark.executorEnv.AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}" \
+      --conf spark.executorEnv.AWS_REGION="${AWS_REGION:-us-east-1}" \
+      --conf spark.executorEnv.AWS_EC2_METADATA_DISABLED="true" \
+      --conf spark.executorEnv.MLFLOW_S3_ENDPOINT_URL="${MINIO_ENDPOINT}" \
       \
       --conf spark.hadoop.fs.s3a.endpoint="${MINIO_ENDPOINT}" \
       --conf spark.hadoop.fs.s3a.path.style.access=true \
@@ -72,6 +73,14 @@ spark_submit () {
       --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider \
       --conf spark.hadoop.fs.s3a.access.key="${AWS_ACCESS_KEY_ID}" \
       --conf spark.hadoop.fs.s3a.secret.key="${AWS_SECRET_ACCESS_KEY}" \
+      \
+      --conf spark.hadoop.fs.file.checksum.enabled=false \
+      --conf spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version=2 \
+      --conf spark.hadoop.mapreduce.fileoutputcommitter.cleanup-failures.ignored=true \
+      --conf spark.hadoop.fs.s3a.committer.name=directory \
+      --conf spark.hadoop.fs.s3a.committer.staging.conflict-mode=append \
+      --conf spark.hadoop.fs.s3a.fast.upload=true \
+      --conf spark.hadoop.fs.s3a.fast.upload.buffer=disk \
       \
       "$app" "$@"
 }
@@ -163,6 +172,7 @@ spark_submit /tmp/_check_schema.py "${INPUT_PATH}"
 """,
     )
 
+    # ✅ FIX HERE: exit immediately on success; cleanup only on failure; cleanup guarded with timeout
     train_model = BashOperator(
         task_id="train_model",
         bash_command=SPARK_WRAPPER + r"""
@@ -178,14 +188,64 @@ PY')"
 
 INPUT_PATH="${GOLD_BASE}/event_date=${DS}"
 echo "[train_model] input_path=${INPUT_PATH}"
-echo "[train_model] spark instances=${SPARK_EXECUTOR_INSTANCES} cores=${SPARK_EXECUTOR_CORES} xgb_workers=${XGB_NUM_WORKERS}"
 
+# Run training, but capture exit code instead of dying immediately
+set +e
 spark_submit /opt/trainner/train_entry.py \
   --config /opt/config.yaml \
   --input "${INPUT_PATH}" \
   --model xgb \
   --run_name "xgb_daily_${DS}"
+exit_code=$?
+set -e
+
+# ✅ If success -> exit NOW so Airflow marks success immediately (no risky cleanup)
+if [ "$exit_code" -eq 0 ]; then
+  echo "✅ Training completed successfully"
+  exit 0
+fi
+
+echo "❌ Training failed with exit code $exit_code"
+
+# Cleanup only when failed (so retry won't be affected by hung processes)
+echo "[cleanup] Killing possible hung train_entry.py..."
+
+# Guard docker exec with timeout so it cannot hang the task
+if command -v timeout >/dev/null 2>&1; then
+  timeout 5s docker exec spark-master pkill -TERM -f "train_entry.py" 2>/dev/null || true
+  sleep 2
+  timeout 5s docker exec spark-master pkill -KILL -f "train_entry.py" 2>/dev/null || true
+else
+  # Fallback if timeout is not installed
+  docker exec spark-master pkill -TERM -f "train_entry.py" 2>/dev/null || true
+  sleep 2
+  docker exec spark-master pkill -KILL -f "train_entry.py" 2>/dev/null || true
+fi
+
+exit "$exit_code"
 """,
+        execution_timeout=timedelta(minutes=15),
     )
 
-    validate_env >> bronze_to_silver >> build_features >> validate_gold_schema >> train_model
+    cleanup_spark = BashOperator(
+        task_id="cleanup_spark_processes",
+        bash_command=r"""
+echo "[cleanup] Final cleanup check..."
+
+docker exec spark-master pkill -9 -f "train_entry.py" 2>/dev/null && \
+    echo "Killed remaining training processes" || \
+    echo "No remaining processes found"
+
+remaining=$(docker exec spark-master ps aux | grep train_entry | grep -v grep | wc -l)
+if [ $remaining -gt 0 ]; then
+    echo "⚠️  Warning: $remaining train_entry processes still running"
+    exit 1
+else
+    echo "✅ All Spark processes cleaned up"
+    exit 0
+fi
+""",
+        trigger_rule="all_done",
+    )
+
+    validate_env >> bronze_to_silver >> build_features >> validate_gold_schema >> train_model >> cleanup_spark
