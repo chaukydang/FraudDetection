@@ -1,149 +1,125 @@
-# /opt/jobs/build_features.py
+# apps/spark_jobs/build_features.py
 import argparse
+import os
+from datetime import datetime, timedelta
+
 import yaml
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
-from pyspark.ml.feature import FeatureHasher, VectorAssembler
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col,
+    lit,
+    sum as _sum,
+    avg as _avg,
+    count as _count,
+    stddev as _stddev,
+    max as _max,
+)
+from pyspark.ml.feature import VectorAssembler
 
 
-def main(cfg_path: str):
-    # --------------------------------------------------
-    # Load config
-    # --------------------------------------------------
-    cfg = yaml.safe_load(open(cfg_path, "r"))
+def load_cfg(path: str) -> dict:
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
 
-    spark = (
-        __import__("pyspark")
-        .sql.SparkSession
-        .builder
-        .appName("build_fraud_features")
-        .getOrCreate()
-    )
+
+def build_spark(cfg: dict) -> SparkSession:
+    spark = SparkSession.builder.appName("build_fraud_features").getOrCreate()
     spark.sparkContext.setLogLevel(cfg["spark"].get("log_level", "WARN"))
 
-    silver_path = f"s3a://{cfg['minio']['bucket']}/{cfg['paths']['silver']}"
-    gold_path   = f"s3a://{cfg['minio']['bucket']}/gold/fraud_features"
+    hconf = spark._jsc.hadoopConfiguration()
+    minio = cfg["minio"]
+    hconf.set("fs.s3a.endpoint", minio["endpoint"])
+    hconf.set("fs.s3a.path.style.access", "true")
+    hconf.set("fs.s3a.connection.ssl.enabled", "false")
+    hconf.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    hconf.set("fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+    hconf.set("fs.s3a.access.key", os.environ.get("AWS_ACCESS_KEY_ID", str(minio["access_key"])))
+    hconf.set("fs.s3a.secret.key", os.environ.get("AWS_SECRET_ACCESS_KEY", str(minio["secret_key"])))
+    return spark
 
-    # --------------------------------------------------
-    # Read silver
-    # --------------------------------------------------
-    df = spark.read.parquet(silver_path)
 
-    if df.rdd.isEmpty():
-        raise RuntimeError("Silver dataset is EMPTY – cannot build features")
+def daterange(ds: str, window_days: int):
+    end = datetime.strptime(ds, "%Y-%m-%d").date()
+    start = end - timedelta(days=window_days - 1)
+    cur = start
+    while cur <= end:
+        yield cur.isoformat()
+        cur += timedelta(days=1)
 
-    # --------------------------------------------------
-    # 1. Basic cleaning & schema normalization
-    # --------------------------------------------------
-    df = (
-        df
-        .withColumn("label", F.col("is_fraud").cast("int"))
-        .withColumn("amount", F.col("amount").cast("double"))
-        .withColumn("event_time", F.col("event_time").cast("timestamp"))
-        .filter(F.col("event_time").isNotNull())
-        .filter(F.col("user_id").isNotNull())
-        .filter(F.col("amount").isNotNull())
+
+def main(config_path: str, ds: str, window_days: int):
+    cfg = load_cfg(config_path)
+    spark = build_spark(cfg)
+
+    silver_root = f"s3a://{cfg['minio']['bucket']}/{cfg['paths']['silver'].strip('/')}"
+    gold_root = f"s3a://{cfg['minio']['bucket']}/{cfg['paths']['gold_features'].strip('/')}"
+
+    # Read window partitions from silver
+    dfs = []
+    for d in daterange(ds, window_days):
+        p = f"{silver_root}/event_date={d}"
+        try:
+            tmp = spark.read.parquet(p)
+            # keep original event_date of the transaction day as txn_date
+            tmp = tmp.withColumn("txn_date", lit(d))
+            dfs.append(tmp)
+        except Exception:
+            continue
+
+    if not dfs:
+        print(f"[build_features] Silver EMPTY for ds={ds}, window_days={window_days}. Exit 0 (skip).")
+        return
+
+    df = dfs[0]
+    for t in dfs[1:]:
+        df = df.unionByName(t, allowMissingColumns=True)
+
+    # ---- Build per-user features AS OF ds ----
+    # Features computed over the whole window; output partition is ALWAYS event_date=ds
+    has_is_fraud = "is_fraud" in df.columns
+
+    agg_exprs = [
+        _count("*").alias("txn_cnt"),
+        _sum("amount").alias("amt_sum"),
+        _avg("amount").alias("amt_avg"),
+        _stddev("amount").alias("amt_std"),
+    ]
+
+    # label: any fraud txn in window => label=1 (demo-friendly)
+    if has_is_fraud:
+        agg_exprs.append(_max(col("is_fraud").cast("double")).alias("label"))
+    else:
+        agg_exprs.append(lit(0.0).alias("label"))
+
+    feats_num = (
+        df.groupBy("user_id")
+        .agg(*agg_exprs)
+        .fillna(0)
+        .withColumn("event_date", lit(ds))  # IMPORTANT: always write ds partition
     )
 
-    # 👉 FIX QUAN TRỌNG: đảm bảo event_date luôn tồn tại
-    df = df.withColumn("event_date", F.to_date("event_time"))
-
-    # --------------------------------------------------
-    # 2. Time features
-    # --------------------------------------------------
-    df = (
-        df
-        .withColumn("hour", F.hour("event_time").cast("int"))
-        .withColumn("dow",  F.dayofweek("event_time").cast("int"))  # 1=Sun..7=Sat
-    )
-
-    # --------------------------------------------------
-    # 3. User rolling features (BATCH SAFE)
-    # --------------------------------------------------
-    # Dùng rowsBetween thay vì rangeBetween (ổn định, rẻ tài nguyên)
-    w = (
-        Window
-        .partitionBy("user_id")
-        .orderBy("event_time")
-        .rowsBetween(-100, 0)   # last 100 transactions
-    )
-
-    df = (
-        df
-        .withColumn("u_cnt_100", F.count("*").over(w).cast("int"))
-        .withColumn("u_avg_100", F.avg("amount").over(w))
-        .withColumn("u_std_100", F.stddev_pop("amount").over(w))
-        .fillna({"u_std_100": 0.0})
-    )
-
-    # --------------------------------------------------
-    # 4. Categorical hashing
-    # --------------------------------------------------
-    hasher = FeatureHasher(
-        inputCols=["currency", "merchant", "location"],
-        outputCol="cat_features",
-        numFeatures=2 ** 18
-    )
-    df = hasher.transform(df)
-
-    # --------------------------------------------------
-    # 5. Assemble final feature vector
-    # --------------------------------------------------
+    feature_cols = ["txn_cnt", "amt_sum", "amt_avg", "amt_std"]
     assembler = VectorAssembler(
-        inputCols=[
-            "amount",
-            "hour",
-            "dow",
-            "u_cnt_100",
-            "u_avg_100",
-            "u_std_100",
-            "cat_features",
-        ],
+        inputCols=feature_cols,
         outputCol="features",
+        handleInvalid="keep",
     )
+    feats = assembler.transform(feats_num)
 
-    out = (
-        assembler
-        .transform(df)
-        .select(
-            "transaction_id",
-            "user_id",
-            "event_time",
-            "event_date",
-            "label",
-            "features",
-        )
-    )
-
-    # --------------------------------------------------
-    # 6. Safety checks
-    # --------------------------------------------------
-    out = out.cache()
-    total = out.count()
-
-    if total == 0:
-        raise RuntimeError("Gold features is EMPTY after transformation")
-
-    print(f"[DEBUG] Gold feature rows = {total}")
-    out.groupBy("label").count().show()
-
-    # --------------------------------------------------
-    # 7. Write GOLD (partitioned, optimized)
-    # --------------------------------------------------
     (
-        out
-        .repartition(2, "event_date")
-        .write
-        .mode("overwrite")
+        feats.repartition(int(cfg["spark"].get("write_partitions", 2)))
+        .write.mode("overwrite")
         .partitionBy("event_date")
-        .parquet(gold_path)
+        .parquet(gold_root)
     )
 
-    print(f"[OK] Gold features written to: {gold_path}")
+    print(f"[build_features] Wrote gold features (label + features) to {gold_root}/event_date={ds}")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
+    ap.add_argument("--date", required=True)
+    ap.add_argument("--window_days", type=int, default=7)
     args = ap.parse_args()
-    main(args.config)
+    main(args.config, args.date, args.window_days)

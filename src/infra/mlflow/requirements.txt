@@ -1,4 +1,19 @@
-cryptography
-boto3
-mlflow
-psycopg2-binary
+# MLflow and core dependencies
+mlflow==2.16.2
+
+# Database support
+psycopg2-binary==2.9.9
+
+# S3/MinIO support
+boto3==1.35.36
+botocore==1.35.36
+
+# Fix MinIO compatibility - CRITICAL
+urllib3>=1.26.18,<2.0.0
+
+# Security and stability
+cryptography>=42.0.0
+pyarrow>=14.0.0
+
+# Optional: Better performance
+gunicorn==21.2.0
