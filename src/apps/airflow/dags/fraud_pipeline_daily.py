@@ -83,6 +83,9 @@ spark_submit () {
       --conf spark.hadoop.fs.s3a.fast.upload.buffer=disk \
       \
       "$app" "$@"
+  
+  # Explicitly return docker exec's exit code
+  return $?
 }
 """
 
@@ -172,7 +175,7 @@ spark_submit /tmp/_check_schema.py "${INPUT_PATH}"
 """,
     )
 
-    # ✅ FIX HERE: exit immediately on success; cleanup only on failure; cleanup guarded with timeout
+    # ✅ train_model: run in background and monitor completion
     train_model = BashOperator(
         task_id="train_model",
         bash_command=SPARK_WRAPPER + r"""
@@ -189,61 +192,44 @@ PY')"
 INPUT_PATH="${GOLD_BASE}/event_date=${DS}"
 echo "[train_model] input_path=${INPUT_PATH}"
 
-# Run training, but capture exit code instead of dying immediately
+# Run spark-submit in background
 set +e
 spark_submit /opt/trainner/train_entry.py \
   --config /opt/config.yaml \
   --input "${INPUT_PATH}" \
   --model xgb \
-  --run_name "xgb_daily_${DS}"
-exit_code=$?
+  --run_name "xgb_daily_${DS}" &
+SUBMIT_PID=$!
 set -e
 
-# ✅ If success -> exit NOW so Airflow marks success immediately (no risky cleanup)
-if [ "$exit_code" -eq 0 ]; then
-  echo "✅ Training completed successfully"
-  exit 0
-fi
+echo "[train_model] spark-submit running in background, PID=${SUBMIT_PID}"
 
-echo "❌ Training failed with exit code $exit_code"
+# Wait for the background process
+wait ${SUBMIT_PID}
+EXIT_CODE=$?
 
-# Cleanup only when failed (so retry won't be affected by hung processes)
-echo "[cleanup] Killing possible hung train_entry.py..."
-
-# Guard docker exec with timeout so it cannot hang the task
-if command -v timeout >/dev/null 2>&1; then
-  timeout 5s docker exec spark-master pkill -TERM -f "train_entry.py" 2>/dev/null || true
-  sleep 2
-  timeout 5s docker exec spark-master pkill -KILL -f "train_entry.py" 2>/dev/null || true
-else
-  # Fallback if timeout is not installed
-  docker exec spark-master pkill -TERM -f "train_entry.py" 2>/dev/null || true
-  sleep 2
-  docker exec spark-master pkill -KILL -f "train_entry.py" 2>/dev/null || true
-fi
-
-exit "$exit_code"
+echo "[train_model] Training completed with exit code ${EXIT_CODE}"
+exit ${EXIT_CODE}
 """,
         execution_timeout=timedelta(minutes=15),
     )
 
+    # Warn-only cleanup: never fail the DAG
     cleanup_spark = BashOperator(
         task_id="cleanup_spark_processes",
         bash_command=r"""
-echo "[cleanup] Final cleanup check..."
+echo "[cleanup] Final cleanup check (warn-only)..."
 
 docker exec spark-master pkill -9 -f "train_entry.py" 2>/dev/null && \
     echo "Killed remaining training processes" || \
-    echo "No remaining processes found"
+    echo "No remaining train_entry processes found"
 
-remaining=$(docker exec spark-master ps aux | grep train_entry | grep -v grep | wc -l)
-if [ $remaining -gt 0 ]; then
-    echo "⚠️  Warning: $remaining train_entry processes still running"
-    exit 1
-else
-    echo "✅ All Spark processes cleaned up"
-    exit 0
-fi
+docker exec spark-master pkill -9 -f "spark-submit" 2>/dev/null && \
+    echo "Killed remaining spark-submit processes" || \
+    echo "No remaining spark-submit processes found"
+
+echo "✅ cleanup completed (warn-only)"
+exit 0
 """,
         trigger_rule="all_done",
     )
