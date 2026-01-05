@@ -67,8 +67,11 @@ def main(config_path: str, ds: str, window_days: int):
             continue
 
     if not dfs:
-        print(f"[build_features] Silver EMPTY for ds={ds}, window_days={window_days}. Exit 0 (skip).")
-        return
+        raise RuntimeError(
+            f"[build_features] No silver data found in window (days={window_days}, ds={ds}). "
+            f"Expected partitions like: {silver_root}/event_date={{date}}. "
+            f"Verify that bronze_to_silver task completed successfully."
+        )
 
     df = dfs[0]
     for t in dfs[1:]:

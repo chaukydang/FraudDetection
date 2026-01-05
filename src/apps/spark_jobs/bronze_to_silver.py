@@ -57,8 +57,11 @@ def main(config_path: str, ds: str, window_days: int):
             continue
 
     if df is None or df.rdd.isEmpty():
-        print(f"[bronze_to_silver] No bronze data in window_days={window_days} for ds={ds}. Exit 0.")
-        return
+        raise RuntimeError(
+            f"[bronze_to_silver] No bronze data found in window (days={window_days}, ds={ds}). "
+            f"Expected partitions like: {bronze_path}/event_date={{date}}. "
+            f"Check if streaming job is running and Kafka producer is active."
+        )
 
     cleaned = (
         df.dropna(subset=["transaction_id", "user_id", "amount", "event_ts"])
