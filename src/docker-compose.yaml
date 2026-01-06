@@ -257,18 +257,25 @@ services:
         condition: service_healthy
     ports:
       - "5500:5500"
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5500"
+      - --backend-store-uri
+      - postgresql://airflow:airflow@postgres:5432/mlflow
+      - --default-artifact-root
+      - s3://mlflow
+      - --serve-artifacts
     environment:
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
-    command: >
-      mlflow server
-      --host 0.0.0.0
-      --port 5500
-      --backend-store-uri postgresql+psycopg2://mlflow:mlflow@postgres/mlflow
-      --default-artifact-root s3://mlflow/
-      --serve-artifacts
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5500/health"]
       interval: 30s
