@@ -1,3 +1,4 @@
+# docker-compose.yaml
 x-airflow-common: &airflow-common
   build: ./infra/airflow
   image: airflow-training:latest
@@ -5,11 +6,11 @@ x-airflow-common: &airflow-common
     - ${ENV_FILE_PATH:-.env}
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
-    AIRFLOW__CORE__FERNET_KEY: ""
+    # FIX: do not leave Fernet key empty (stability + secrets encryption)
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
 
-    # ---- Laptop mode ----
     AIRFLOW__CORE__PARALLELISM: 8
     AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 4
     AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: 1
@@ -29,7 +30,6 @@ x-airflow-common: &airflow-common
     MLFLOW_TRACKING_URI: "http://mlflow-server:5500"
     MLFLOW_S3_ENDPOINT_URL: "http://minio:9000"
 
-    # ✅ keep region consistent across all containers
     AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
 
     PYTHONPATH: "/opt/airflow:/opt"
@@ -45,6 +45,7 @@ x-airflow-common: &airflow-common
     - ./shared/.env:/opt/.env
     - ./shared/trainner:/opt/trainner
     - ./apps/spark_jobs:/opt/jobs
+    # DEV-ONLY: docker socket gives host-level control to Airflow container
     - /var/run/docker.sock:/var/run/docker.sock
 
   user: "${AIRFLOW_UID:-50000}:0"

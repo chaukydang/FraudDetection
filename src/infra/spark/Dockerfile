@@ -3,7 +3,6 @@ FROM apache/spark:3.5.1-scala2.12-java17-ubuntu
 
 USER root
 
-# Install system dependencies
 RUN set -eux; \
   apt-get update; \
   apt-get install -y --no-install-recommends \
@@ -13,19 +12,10 @@ RUN set -eux; \
   ; \
   rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip tooling
 RUN python3 -m pip install --no-cache-dir -U pip setuptools wheel
 
-# -----------------------------
-# Python deps for Spark jobs
-# -----------------------------
-# CRITICAL FIX: Install urllib3<2.0.0 FIRST to prevent MinIO HeaderParsingError
 RUN python3 -m pip install --no-cache-dir 'urllib3>=1.26.18,<2.0.0'
 
-# NOTE:
-# - pyspark already inside Spark distribution => DO NOT pip install pyspark
-# - mlflow<3 requires pyarrow < 16
-# - boto3/botocore versions locked for compatibility
 RUN python3 -m pip install --no-cache-dir \
   mlflow==2.16.2 \
   'pyarrow>=14.0.0,<16' \
@@ -46,9 +36,6 @@ RUN python3 -m pip install --no-cache-dir \
   psycopg2-binary==2.9.9 \
   && python3 -m pip cache purge
 
-# -----------------------------
-# S3A (MinIO) jars
-# -----------------------------
 ARG HADOOP_AWS_VERSION=3.3.4
 ARG AWS_BUNDLE_VERSION=1.12.262
 

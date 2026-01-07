@@ -1,158 +1,151 @@
-# shared/trainner/train_entry.py
+# /opt/trainner/train_entry.py
 import argparse
-import logging
 import os
-import signal
+import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Dict, List
+
+import yaml
+import mlflow
+from pyspark.sql import SparkSession
+
 import sys
-import time
-import threading
+sys.path.insert(0, os.path.dirname(__file__))
 
-from fraud_detection_training import FraudDetectionTraining
-
-MARKER_PATH = "/tmp/train_done.ok"
-_SHOULD_STOP = False
+_ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
-def _setup_logging():
-    """
-    Clean logs for Airflow:
-    - Reduce urllib3/botocore spam (MinIO header parsing warnings)
-    - Keep our app logs at INFO
-    """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+def _expand_env(obj):
+    if isinstance(obj, dict):
+        return {k: _expand_env(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env(v) for v in obj]
+    if isinstance(obj, str):
+        def repl(m):
+            name = m.group(1)
+            return os.getenv(name, m.group(0))
+        return _ENV_RE.sub(repl, obj)
+    return obj
+
+
+def load_cfg(path: str) -> Dict:
+    with open(path, "r") as f:
+        cfg = yaml.safe_load(f) or {}
+    return _expand_env(cfg)
+
+
+def daterange(ds: str, window_days: int) -> List[str]:
+    end = datetime.strptime(ds, "%Y-%m-%d").date()
+    start = end - timedelta(days=window_days - 1)
+    out = []
+    cur = start
+    while cur <= end:
+        out.append(cur.isoformat())
+        cur += timedelta(days=1)
+    return out
+
+
+def build_spark(cfg: Dict) -> SparkSession:
+    minio = cfg["minio"]
+    spark_cfg = cfg.get("spark", {}) or {}
+
+    log_level = spark_cfg.get("log_level", "WARN")
+    session_tz = spark_cfg.get("session_timezone", "UTC")
+    shuffle_partitions = int(spark_cfg.get("shuffle_partitions", 4))
+
+    spark = (
+        SparkSession.builder
+        .appName("fraud_train_entry")
+        .config("spark.sql.session.timeZone", session_tz)
+        .config("spark.sql.shuffle.partitions", str(shuffle_partitions))
+        .config("spark.sql.files.ignoreMissingFiles", "true")
+        .config("spark.sql.files.ignoreCorruptFiles", "true")
+        .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
+        # Parquet reader: tránh chết vì file cũ weird (vẫn có thể fail nếu schema drift quá nặng,
+        # nhưng phía fraud_detection_training.py sẽ scan/skip partition hỏng)
+        .config("spark.sql.parquet.mergeSchema", "false")
+        # S3A / MinIO
+        .config("spark.hadoop.fs.s3a.endpoint", minio["endpoint"])
+        .config("spark.hadoop.fs.s3a.path.style.access", "true")
+        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .config("spark.hadoop.fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+        .config("spark.hadoop.fs.s3a.access.key", os.environ.get("AWS_ACCESS_KEY_ID", str(minio.get("access_key", ""))))
+        .config("spark.hadoop.fs.s3a.secret.key", os.environ.get("AWS_SECRET_ACCESS_KEY", str(minio.get("secret_key", ""))))
+        .getOrCreate()
     )
-
-    # Silence noisy libs
-    logging.getLogger("urllib3").setLevel(logging.ERROR)
-    logging.getLogger("botocore").setLevel(logging.WARNING)
-    logging.getLogger("boto3").setLevel(logging.WARNING)
-    logging.getLogger("requests").setLevel(logging.WARNING)
-    logging.getLogger("mlflow").setLevel(logging.INFO)  # keep run links etc.
+    spark.sparkContext.setLogLevel(log_level)
+    return spark
 
 
-_setup_logging()
-logger = logging.getLogger("train_entry")
+@dataclass
+class TrainArgs:
+    config: str
+    ds: str
+    window_days: int
+    model: str
+    run_name: str
+    register: bool
 
 
-def _handle_signal(signum, frame):
-    global _SHOULD_STOP
-    logger.warning("Received signal %s, attempting graceful shutdown...", signum)
-    _SHOULD_STOP = True
+def configure_mlflow(cfg: Dict) -> None:
+    ml = cfg.get("mlflow", {}) or {}
+    tracking_uri = ml.get("tracking_uri") or os.getenv("MLFLOW_TRACKING_URI")
+    if tracking_uri:
+        mlflow.set_tracking_uri(tracking_uri)
+
+    exp_name = ml.get("experiment_name", "fraud_detection")
+    mlflow.set_experiment(exp_name)
+
+    s3_endpoint_url = ml.get("s3_endpoint_url") or os.getenv("MLFLOW_S3_ENDPOINT_URL")
+    if s3_endpoint_url:
+        os.environ["MLFLOW_S3_ENDPOINT_URL"] = s3_endpoint_url
 
 
-def _write_marker(exit_code: int) -> None:
-    try:
-        with open(MARKER_PATH, "w") as f:
-            f.write(f"exit_code={int(exit_code)}\n")
-        logger.info("Wrote marker %s", MARKER_PATH)
-    except Exception as e:
-        logger.warning("Failed to write marker: %s", e)
-
-
-def _shutdown_py4j_callback_server(trainer: FraudDetectionTraining) -> None:
-    """
-    Best-effort shutdown of Py4J callback server to avoid hanging threads.
-    """
-    try:
-        spark = getattr(trainer, "_spark_for_shutdown", None)
-        if not spark:
-            return
-        sc = spark.sparkContext
-        gw = getattr(sc, "_gateway", None)
-        if gw:
-            try:
-                gw.shutdown_callback_server()
-                logger.info("Py4J callback server shutdown")
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
-def _wait_threads(wait_sec: float = 5.0):
-    main_thread = threading.current_thread()
-    others = [t for t in threading.enumerate() if t != main_thread]
-    if not others:
-        return []
-
-    deadline = time.time() + wait_sec
-    for t in others:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        if t.is_alive():
-            t.join(timeout=remaining)
-
-    return [t for t in others if t.is_alive()]
-
-
-def main():
-    # keep logs clean even if wrapper forgot
-    os.environ.setdefault("GIT_PYTHON_REFRESH", "quiet")
-    os.environ.setdefault("MLFLOW_DISABLE_GIT_METADATA", "true")
-
-    # optional: prevent MLflow from trying to talk to EC2 metadata
-    os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
-
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="/opt/config.yaml")
-    ap.add_argument("--input", required=True)
-    ap.add_argument("--model", default="gbt")
-    ap.add_argument("--run_name", default=None)
-    ap.add_argument("--seed", type=int, default=42)
-    args = ap.parse_args()
-
-    exit_code = 0
-    trainer = None
+def main(args: TrainArgs) -> int:
+    cfg = load_cfg(args.config)
+    configure_mlflow(cfg)
+    spark = build_spark(cfg)
 
     try:
-        if _SHOULD_STOP:
-            raise RuntimeError("Stopped before init (received termination signal)")
-
-        trainer = FraudDetectionTraining(config_path=args.config)
-
-        if _SHOULD_STOP:
-            raise RuntimeError("Stopped before training (received termination signal)")
-
-        res = trainer.train_model(
-            input_path=args.input,
-            model_type=args.model,
+        from fraud_detection_training import train_and_log
+        return train_and_log(
+            spark=spark,
+            cfg=cfg,
+            ds=args.ds,
+            window_days=args.window_days,
+            model_name=args.model,
             run_name=args.run_name,
-            seed=args.seed,
+            register=args.register,
         )
-        logger.info("Training result: %s", res)
-        logger.info("✅ Training completed successfully")
-
-    except Exception as e:
-        # keep stacktrace for debugging (Airflow logs still manageable now that urllib3 spam is gone)
-        logger.error("❌ Training failed: %s", e, exc_info=True)
-        exit_code = 1
-
     finally:
-        _write_marker(exit_code)
-
         try:
-            sys.stdout.flush()
-            sys.stderr.flush()
+            spark.stop()
         except Exception:
             pass
 
-        if trainer:
-            _shutdown_py4j_callback_server(trainer)
-
-        alive = _wait_threads(wait_sec=5.0)
-        if alive:
-            logger.warning("Threads still alive: %s", [t.name for t in alive])
-            logger.warning("Force hard-exit to prevent hanging...")
-            os._exit(exit_code)
-
-        raise SystemExit(exit_code)
-
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--ds", required=True)               # yyyy-mm-dd
+    ap.add_argument("--window_days", type=int, default=7)
+    ap.add_argument("--model", default="gbt", choices=["gbt", "lr", "rf"])
+    ap.add_argument("--run_name", default="")
+    ap.add_argument("--register", type=int, default=1)  # 1/0
+    ns = ap.parse_args()
+
+    run_name = ns.run_name or f"{ns.model}_windowed_{ns.ds}"
+
+    code = main(
+        TrainArgs(
+            config=ns.config,
+            ds=ns.ds,
+            window_days=ns.window_days,
+            model=ns.model,
+            run_name=run_name,
+            register=bool(ns.register),
+        )
+    )
+    raise SystemExit(code)
