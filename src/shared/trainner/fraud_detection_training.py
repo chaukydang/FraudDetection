@@ -1,5 +1,6 @@
 # /opt/trainner/fraud_detection_training.py
 import json
+import os
 from datetime import datetime, timedelta
 from typing import Dict, List
 
@@ -19,7 +20,7 @@ from pyspark.ml.functions import vector_to_array
 def daterange(ds: str, window_days: int) -> List[str]:
     end = datetime.strptime(ds, "%Y-%m-%d").date()
     start = end - timedelta(days=window_days - 1)
-    out: List[str] = []
+    out = []
     cur = start
     while cur <= end:
         out.append(cur.isoformat())
@@ -41,59 +42,47 @@ def _path_exists(spark: SparkSession, path_str: str) -> bool:
     return bool(fs.exists(p))
 
 
-def _read_existing_partitions_with_basepath(
-    spark: SparkSession,
-    base_path: str,
-    partition_paths: List[str],
-) -> DataFrame:
-    existing = [p for p in partition_paths if _path_exists(spark, p)]
-    if not existing:
-        raise RuntimeError(f"No existing partitions found under basePath={base_path} for given paths.")
-    return spark.read.option("basePath", base_path).parquet(*existing)
-
-
-def _collect_event_dates_from_bronze_ingest(
-    spark: SparkSession,
-    cfg: Dict,
-    ds: str,
-    window_days: int,
-) -> List[str]:
+def load_gold_window(spark: SparkSession, cfg: Dict, ds: str, window_days: int) -> DataFrame:
     """
-    Drive training by ingest window in bronze (same idea as silver_to_gold_features):
-    - Read bronze ingest partitions in [ds-window+1 .. ds]
-    - Collect distinct event_date appearing (late events included)
+    Read gold by partition PATHS in the ds window (robust, no type mismatch).
+    This avoids empty result caused by comparing date column with string list.
     """
-    bronze_base = _s3a_path(cfg, "bronze")
-    ingest_part_col = (cfg.get("paths", {}) or {}).get("bronze_partition_col", "ingest_date") or "ingest_date"
-    ingest_part_col = ingest_part_col.strip() or "ingest_date"
-
-    ingest_dates = daterange(ds, window_days)
-    bronze_parts = [f"{bronze_base}/{ingest_part_col}={d}" for d in ingest_dates]
-    df_bronze = _read_existing_partitions_with_basepath(spark, bronze_base, bronze_parts)
-
-    if "event_date" not in df_bronze.columns:
-        if "event_ts" in df_bronze.columns:
-            df_bronze = df_bronze.withColumn("event_date", F.to_date(F.col("event_ts")))
-        else:
-            raise RuntimeError("Bronze missing both event_date and event_ts; cannot derive event_dates.")
-
-    ev = (
-        df_bronze.select(F.col("event_date").cast("date").alias("event_date"))
-        .where(F.col("event_date").isNotNull())
-        .distinct()
-        .collect()
-    )
-    return sorted({r["event_date"].isoformat() for r in ev})
-
-
-def load_gold_by_event_dates(spark: SparkSession, cfg: Dict, event_dates: List[str]) -> DataFrame:
     gold_root = _s3a_path(cfg, "gold_features")
+
+    # Force partition col to event_date (matching your pipeline)
     part_col = (cfg.get("paths", {}) or {}).get("gold_partition_col", "event_date").strip() or "event_date"
     if part_col != "event_date":
         part_col = "event_date"
 
-    gold_parts = [f"{gold_root}/{part_col}={d}" for d in event_dates]
-    return _read_existing_partitions_with_basepath(spark, gold_root, gold_parts)
+    dates = daterange(ds, window_days)
+
+    # Build partition paths and keep only existing ones
+    part_paths = [f"{gold_root}/{part_col}={d}" for d in dates]
+    existing = [p for p in part_paths if _path_exists(spark, p)]
+
+    print(f"[train] requested_dates={dates} existing_parts={len(existing)}", flush=True)
+    if not existing:
+        raise RuntimeError(
+            f"No gold partitions exist for window ds={ds} window_days={window_days}. "
+            f"gold_root={gold_root} part_col={part_col}"
+        )
+
+    # Read only existing partitions; basePath preserves partition column
+    df = (
+        spark.read.option("basePath", gold_root)
+        .option("mergeSchema", "false")
+        .parquet(*existing)
+    )
+
+    # Normalize event_date to string consistently
+    if "event_date" in df.columns:
+        df = df.withColumn("event_date", F.col("event_date").cast("string"))
+
+    # Safety: ensure we only keep requested dates (now comparison is string vs string)
+    if "event_date" in df.columns:
+        df = df.where(F.col("event_date").isin(dates))
+
+    return df
 
 
 def validate_gold(df: DataFrame) -> None:
@@ -115,18 +104,16 @@ def validate_gold(df: DataFrame) -> None:
         raise RuntimeError("Found NULL features")
 
 
-def prepare_training_frame(df_gold: DataFrame) -> DataFrame:
-    # sanitize user_id (handles schema drift int/string)
-    user_id_str = F.col("user_id").cast("string")
-    user_id_digits = F.regexp_extract(F.trim(user_id_str), r"(\d+)", 1)
-    user_id_int = F.when(F.length(user_id_digits) == 0, F.lit(None)).otherwise(user_id_digits.cast("int"))
-
-    return df_gold.select(
-        user_id_int.alias("user_id"),
-        F.col("event_date").cast("string").alias("event_date"),
+def prepare_training_frame(df: DataFrame) -> DataFrame:
+    out = df.select(
+        F.col("user_id"),
+        F.col("event_date"),
         F.col("features"),
         F.col("label").cast(IntegerType()).alias("label"),
     )
+    if "features" not in out.columns:
+        raise RuntimeError("Missing features column after select")
+    return out
 
 
 def build_model(model_name: str):
@@ -219,20 +206,27 @@ def train_and_log(
     run_name: str,
     register: bool,
 ) -> int:
-    # ✅ align window to bronze ingest -> event_dates (late events included)
-    event_dates = _collect_event_dates_from_bronze_ingest(spark, cfg, ds, window_days)
-    if not event_dates:
-        raise RuntimeError(f"No event_date found in bronze ingest window for ds={ds} window_days={window_days}")
+    df_gold = load_gold_window(spark, cfg, ds, window_days)
+    validate_gold(df_gold)
 
-    print(f"[train] ds={ds} window_days={window_days} -> event_dates_used={event_dates}", flush=True)
-
-    df_gold = load_gold_by_event_dates(spark, cfg, event_dates)
     df = prepare_training_frame(df_gold).cache()
-    validate_gold(df)
+
+    # Fail fast BEFORE creating MLflow run if empty
+    nrows = df.count()
+    if nrows == 0:
+        df.unpersist()
+        raise RuntimeError(f"No rows to train after window filter ds={ds} window_days={window_days}")
+
+    used_dates = sorted([r["event_date"] for r in df.select("event_date").distinct().collect()])
+    print(f"[train] ds={ds} window_days={window_days} -> event_dates_used={used_dates} n_rows={nrows}", flush=True)
 
     stats = log_dataset_stats(df)
-
     train_df, val_df = df.randomSplit([0.8, 0.2], seed=42)
+
+    # Guard: randomSplit can yield empty train on tiny datasets
+    if train_df.limit(1).count() == 0:
+        df.unpersist()
+        raise RuntimeError("Train split is empty (dataset too small). Increase data or adjust split.")
 
     clf = build_model(model_name)
     pipeline = Pipeline(stages=[clf])
@@ -246,7 +240,6 @@ def train_and_log(
         "model": model_name,
         "pipeline": "gold->train",
         "experiment": exp_name,
-        "event_dates_used": ",".join(event_dates),
     }
 
     with mlflow.start_run(run_name=run_name, tags=tags) as run:
@@ -278,19 +271,27 @@ def train_and_log(
             "model": model_name,
             "metrics": metrics,
             "dataset": stats,
-            "event_dates_used": event_dates,
+            "event_dates_used": used_dates,
         }
         tmp = "/tmp/train_summary.json"
         with open(tmp, "w") as f:
             json.dump(summary, f, indent=2)
         mlflow.log_artifact(tmp, artifact_path="reports")
 
-        # ✅ IMPORTANT FIX: do NOT "import mlflow.spark" inside function (causes UnboundLocalError)
+        # ✅ Robust MLflow spark logging: avoid Spark writing to s3:// temp
         artifact_path = "model"
+        os.makedirs("/tmp/mlflow", exist_ok=True)
+
         try:
-            from mlflow import spark as mlflow_spark
-            mlflow_spark.log_model(model, artifact_path=artifact_path)
+            # IMPORTANT: do NOT "import mlflow.spark" (that can shadow mlflow and cause UnboundLocalError)
+            import mlflow.spark as mlflow_spark  # binds mlflow_spark only
+            mlflow_spark.log_model(
+                model,
+                artifact_path=artifact_path,
+                dfs_tmpdir="file:/tmp/mlflow",
+            )
         except Exception:
+            # fallback: save pipeline model locally then log as generic artifact
             local_path = "/tmp/spark_model"
             model.write().overwrite().save(local_path)
             mlflow.log_artifacts(local_path, artifact_path=artifact_path)
