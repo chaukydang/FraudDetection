@@ -406,6 +406,8 @@ spark_submit /tmp/_validate_gold_window.py "${GOLD_ROOT}" "${PART_COL}" "${DS}" 
         --conf spark.hadoop.fs.s3a.path.style.access=true \
         --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
         --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+        --conf spark.hadoop.fs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+        --conf spark.hadoop.fs.AbstractFileSystem.s3.impl=org.apache.hadoop.fs.s3a.S3A \
         --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider \
         --conf spark.hadoop.fs.s3a.access.key='${AWS_ACCESS_KEY_ID}' \
         --conf spark.hadoop.fs.s3a.secret.key='${AWS_SECRET_ACCESS_KEY}' \

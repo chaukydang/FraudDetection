@@ -10,8 +10,6 @@ import yaml
 import mlflow
 from pyspark.sql import SparkSession
 
-import sys
-sys.path.insert(0, os.path.dirname(__file__))
 
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -60,11 +58,14 @@ def build_spark(cfg: Dict) -> SparkSession:
         .config("spark.sql.session.timeZone", session_tz)
         .config("spark.sql.shuffle.partitions", str(shuffle_partitions))
         .config("spark.sql.files.ignoreMissingFiles", "true")
-        .config("spark.sql.files.ignoreCorruptFiles", "true")
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
-        # Parquet reader: tránh chết vì file cũ weird (vẫn có thể fail nếu schema drift quá nặng,
-        # nhưng phía fraud_detection_training.py sẽ scan/skip partition hỏng)
-        .config("spark.sql.parquet.mergeSchema", "false")
+
+        # ✅ Map s3:// to S3A to avoid "No FileSystem for scheme s3"
+        .config("spark.hadoop.fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .config("spark.hadoop.fs.AbstractFileSystem.s3.impl", "org.apache.hadoop.fs.s3a.S3A")
+        .config("spark.hadoop.fs.s3n.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .config("spark.hadoop.fs.AbstractFileSystem.s3n.impl", "org.apache.hadoop.fs.s3a.S3A")
+
         # S3A / MinIO
         .config("spark.hadoop.fs.s3a.endpoint", minio["endpoint"])
         .config("spark.hadoop.fs.s3a.path.style.access", "true")
@@ -98,19 +99,31 @@ def configure_mlflow(cfg: Dict) -> None:
     exp_name = ml.get("experiment_name", "fraud_detection")
     mlflow.set_experiment(exp_name)
 
+    # ✅ Ensure endpoint for artifact store in MinIO
     s3_endpoint_url = ml.get("s3_endpoint_url") or os.getenv("MLFLOW_S3_ENDPOINT_URL")
     if s3_endpoint_url:
         os.environ["MLFLOW_S3_ENDPOINT_URL"] = s3_endpoint_url
+
+    # ✅ Make sure boto3 has creds (so list_artifacts / log_artifacts works even outside wrapper)
+    # Prefer env, fallback to config minio creds
+    minio = cfg.get("minio", {}) or {}
+    os.environ.setdefault("AWS_ACCESS_KEY_ID", str(minio.get("access_key", "")))
+    os.environ.setdefault("AWS_SECRET_ACCESS_KEY", str(minio.get("secret_key", "")))
+    os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
+    os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+    os.environ.setdefault("AWS_REGION", "us-east-1")
 
 
 def main(args: TrainArgs) -> int:
     cfg = load_cfg(args.config)
     configure_mlflow(cfg)
+
     spark = build_spark(cfg)
 
     try:
         from fraud_detection_training import train_and_log
-        return train_and_log(
+
+        rc = train_and_log(
             spark=spark,
             cfg=cfg,
             ds=args.ds,
@@ -119,6 +132,7 @@ def main(args: TrainArgs) -> int:
             run_name=args.run_name,
             register=args.register,
         )
+        return rc
     finally:
         try:
             spark.stop()
