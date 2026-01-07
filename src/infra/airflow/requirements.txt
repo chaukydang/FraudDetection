@@ -1,12 +1,8 @@
-# infra/airflow/requirements.txt
-
-# Providers hay dùng với Celery + Postgres
+# src/infra/airflow/requirements.txt
 apache-airflow-providers-celery==3.8.2
 apache-airflow-providers-postgres==5.12.0
 
-# Utils (nếu DAG có đọc yaml/env)
 pyyaml==6.0.2
 python-dotenv==1.0.1
 
-# Nếu bạn cần gọi HTTP healthcheck / requests trong custom code
 requests==2.32.3

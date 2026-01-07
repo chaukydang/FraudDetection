@@ -1,20 +1,16 @@
-# Core ML/MLOps
+# src/infra/spark/requirements.txt
 mlflow==2.16.2
 xgboost==2.1.1
 scikit-learn==1.5.2
 
-# Data processing
 pandas==2.2.3
 pyarrow==14.0.2
 
-# Utils
 python-dotenv==1.0.1
 pyyaml==6.0.2
 
-# S3/MinIO support with fixed urllib3
 boto3==1.35.36
 botocore==1.35.36
 urllib3>=1.26.18,<2.0.0
 
-# PostgreSQL (if needed)
 psycopg2-binary==2.9.9

@@ -1,3 +1,4 @@
+# src/apps/producer/main.py
 import json
 import logging
 import os
@@ -24,7 +25,6 @@ logger = logging.getLogger("transaction-producer")
 # -----------------------------------------------------------------------------
 # Env
 # -----------------------------------------------------------------------------
-# In container: keep /app/.env as you did; if not found, dotenv just won't fail.
 load_dotenv(dotenv_path=os.getenv("DOTENV_PATH", "/app/.env"))
 
 fake = Faker()
@@ -60,9 +60,6 @@ TRANSACTION_SCHEMA = {
 
 class TransactionProducer:
     def __init__(self) -> None:
-        # -----------------------------
-        # Runtime knobs
-        # -----------------------------
         self.topic = os.getenv("KAFKA_TOPIC", "transactions")
         self.running = False
 
@@ -83,9 +80,7 @@ class TransactionProducer:
             "QuickCash", "GlobalDigital", "FastMoneyX"
         ]
 
-        # -----------------------------
         # Kafka (Confluent Cloud)
-        # -----------------------------
         bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "")
         username = os.getenv("KAFKA_USERNAME", "")
         password = os.getenv("KAFKA_PASSWORD", "")
@@ -93,7 +88,6 @@ class TransactionProducer:
         if not bootstrap:
             raise ValueError("Missing KAFKA_BOOTSTRAP_SERVERS")
 
-        # Baseline: safe delivery (idempotent + acks=all)
         cfg: Dict[str, Any] = {
             "bootstrap.servers": bootstrap,
             "client.id": os.getenv("KAFKA_CLIENT_ID", "transaction-producer"),
@@ -120,8 +114,12 @@ class TransactionProducer:
             "socket.keepalive.enable": os.getenv("KAFKA_SOCKET_KEEPALIVE", "True") == "True",
         }
 
+        # Fix (minimal): idempotence requires max.in.flight <= 5
+        if cfg["enable.idempotence"] and cfg["max.in.flight.requests.per.connection"] > 5:
+            logger.warning("max.in.flight > 5 with idempotence; forcing to 5 for safety")
+            cfg["max.in.flight.requests.per.connection"] = 5
+
         # Confluent Cloud requires SASL_SSL
-        # (You can keep env defaults you already have.)
         cfg.update({
             "security.protocol": os.getenv("KAFKA_SECURITY_PROTOCOL", "SASL_SSL"),
             "sasl.mechanism": os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
@@ -129,7 +127,6 @@ class TransactionProducer:
             "sasl.password": password,
         })
 
-        # Validate required auth fields for Confluent Cloud
         if not username or not password:
             raise ValueError("Missing KAFKA_USERNAME / KAFKA_PASSWORD for Confluent Cloud")
 
@@ -148,14 +145,10 @@ class TransactionProducer:
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGTERM, self.shutdown)
 
-    # -------------------------------------------------------------------------
-    # Generate / validate
-    # -------------------------------------------------------------------------
     def _make_transaction(self) -> Dict[str, Any]:
         merchant = random.choice(self.merchants) if self.use_fast_merchants else fake.company()
 
         now = datetime.now(timezone.utc)
-        # Keep event time mostly around "now" (avoid too much future time)
         event_time = (now + timedelta(seconds=random.randint(-300, 30))).isoformat()
 
         tx: Dict[str, Any] = {
@@ -165,41 +158,35 @@ class TransactionProducer:
             "amount": round(fake.pyfloat(min_value=0.01, max_value=10000), 2),
             "currency": "USD",
             "merchant": merchant,
-            "timestamp": event_time,         # event_time
-            "producer_ts": now.isoformat(),  # emit time
+            "timestamp": event_time,
+            "producer_ts": now.isoformat(),
             "source_id": os.getenv("HOSTNAME", "producer"),
             "location": fake.country_code(),
             "is_fraud": 0,
         }
 
-        # Fraud simulation
         is_fraud = 0
         amount = tx["amount"]
         user_id = tx["user_id"]
 
-        # Account takeover
         if user_id in self.compromised_users and amount > 500 and random.random() < 0.3:
             is_fraud = 1
             tx["amount"] = round(random.uniform(500, 5000), 2)
             tx["merchant"] = random.choice(self.high_risk_merchants)
 
-        # Card testing
         if not is_fraud and amount < 2.0 and user_id % 1000 == 0 and random.random() < 0.25:
             is_fraud = 1
             tx["amount"] = round(random.uniform(0.01, 2), 2)
             tx["location"] = "US"
 
-        # Merchant collusion
         if not is_fraud and tx["merchant"] in self.high_risk_merchants and amount > 3000 and random.random() < 0.15:
             is_fraud = 1
             tx["amount"] = round(random.uniform(300, 1500), 2)
 
-        # Geographic anomalies
         if not is_fraud and user_id % 500 == 0 and random.random() < 0.1:
             is_fraud = 1
             tx["location"] = random.choice(["CN", "RU", "GB"])
 
-        # Baseline random fraud
         if not is_fraud and random.random() < 0.002:
             is_fraud = 1
             tx["amount"] = round(random.uniform(100, 2000), 2)
@@ -223,9 +210,6 @@ class TransactionProducer:
         tx = self._make_transaction()
         return tx if self._validate(tx) else None
 
-    # -------------------------------------------------------------------------
-    # Kafka send
-    # -------------------------------------------------------------------------
     def delivery_report(self, err, msg) -> None:
         if err is not None:
             logger.error("Delivery failed: %s topic=%s key=%s", err, msg.topic(), msg.key())
@@ -243,16 +227,11 @@ class TransactionProducer:
             )
 
     def _produce_with_backpressure(self, key: bytes, value: bytes) -> bool:
-        """
-        Avoid data loss:
-        - If local queue is full, poll + retry a few times instead of dropping.
-        """
         for attempt in range(self.max_buffer_retries + 1):
             try:
                 self.producer.produce(self.topic, key=key, value=value, callback=self.delivery_report)
                 return True
             except BufferError:
-                # Let librdkafka deliver queued messages and free up space
                 self.producer.poll(self.poll_timeout_sec)
                 time.sleep(0.05 * (attempt + 1))
                 continue
@@ -269,7 +248,6 @@ class TransactionProducer:
         if not tx:
             return False
 
-        # Key by user_id for better per-user ordering/state in Spark
         key = str(tx["user_id"]).encode("utf-8")
         value = json.dumps(tx, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
@@ -278,9 +256,6 @@ class TransactionProducer:
             self._produced_count += 1
         return ok
 
-    # -------------------------------------------------------------------------
-    # Loop / shutdown
-    # -------------------------------------------------------------------------
     def run(self) -> None:
         self.running = True
         logger.info("Starting production loop. topic=%s", self.topic)
@@ -292,10 +267,8 @@ class TransactionProducer:
                         break
                     self.send_transaction()
 
-                # process delivery callbacks
                 self.producer.poll(self.poll_timeout_sec)
 
-                # throttle
                 if self.batch_sleep_sec > 0:
                     time.sleep(self.batch_sleep_sec)
 

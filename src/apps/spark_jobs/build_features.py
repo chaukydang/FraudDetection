@@ -1,11 +1,11 @@
-# apps/spark_jobs/build_features.py
+# src/apps/spark_jobs/build_features.py
 import argparse
 import os
 from datetime import datetime, timedelta
-from typing import List, Tuple
+from typing import List
 
 import yaml
-from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col,
     lit,
@@ -14,13 +14,11 @@ from pyspark.sql.functions import (
     count as _count,
     stddev as _stddev,
     max as _max,
+    when,
 )
 from pyspark.ml.feature import VectorAssembler
 
 
-# ----------------------------
-# Utils
-# ----------------------------
 def load_cfg(path: str) -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
@@ -29,6 +27,9 @@ def load_cfg(path: str) -> dict:
 def build_spark(cfg: dict) -> SparkSession:
     spark = SparkSession.builder.appName("build_fraud_features").getOrCreate()
     spark.sparkContext.setLogLevel(cfg.get("spark", {}).get("log_level", "WARN"))
+
+    # Idempotency safety: overwrite only touched partitions (even outside Airflow wrapper)
+    spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
     hconf = spark._jsc.hadoopConfiguration()
     minio = cfg["minio"]
@@ -65,13 +66,12 @@ def path_exists(spark: SparkSession, path: str) -> bool:
         p = jvm.org.apache.hadoop.fs.Path(path)
         fs = p.getFileSystem(hconf)
         return bool(fs.exists(p))
-    except Exception:
+    except Exception as e:
+        # Don't silently treat infra/credential errors as "missing data"
+        print(f"[build_features] WARN path_exists failed for {path}: {e}")
         return False
 
 
-# ----------------------------
-# Main
-# ----------------------------
 def main(
     config_path: str,
     ds: str,
@@ -81,6 +81,14 @@ def main(
 ):
     cfg = load_cfg(config_path)
     spark = build_spark(cfg)
+
+    # Guard: ensure dynamic partition overwrite is active (idempotency safety)
+    pow_mode = spark.conf.get("spark.sql.sources.partitionOverwriteMode", None)
+    if pow_mode != "dynamic":
+        raise RuntimeError(
+            f"[build_features] spark.sql.sources.partitionOverwriteMode must be 'dynamic' for safe overwrites. "
+            f"Got={pow_mode!r}"
+        )
 
     bucket = cfg["minio"]["bucket"]
     silver_root = f"s3a://{bucket}/{cfg['paths']['silver'].strip('/')}"
@@ -114,12 +122,20 @@ def main(
     for d in dfs[1:]:
         df = df.unionByName(d, allowMissingColumns=True)
 
-    # ---- validate ----
+    # ---- validate required columns ----
     for c in ["user_id", "amount"]:
         if c not in df.columns:
             raise RuntimeError(f"[build_features] Missing required column '{c}'")
 
-    has_is_fraud = "is_fraud" in df.columns
+    # ✅ Label source
+    # We standardized is_fraud in silver in bronze_to_silver.py
+    if "is_fraud" not in df.columns:
+        # Fallback to label if exists; else 0
+        if "label" in df.columns:
+            df = df.withColumn("is_fraud", col("label").cast("double"))
+        else:
+            print("[build_features][WARN] missing is_fraud/label -> defaulting is_fraud=0.0")
+            df = df.withColumn("is_fraud", lit(0.0))
 
     # ---- aggregate features (as-of DS) ----
     agg_exprs = [
@@ -127,12 +143,8 @@ def main(
         _sum(col("amount").cast("double")).alias("amt_sum"),
         _avg(col("amount").cast("double")).alias("amt_avg"),
         _stddev(col("amount").cast("double")).alias("amt_std"),
+        _max(col("is_fraud").cast("double")).alias("label"),  # if user had any fraud in window => 1
     ]
-
-    if has_is_fraud:
-        agg_exprs.append(_max(col("is_fraud").cast("double")).alias("label"))
-    else:
-        agg_exprs.append(lit(0.0).alias("label"))
 
     feats_num = (
         df.groupBy("user_id")
@@ -148,11 +160,18 @@ def main(
     )
     feats = assembler.transform(feats_num)
 
-    # ---- stats ----
-    total = feats.count()
-    pos = feats.filter(col("label") == 1.0).count()
-    neg = feats.filter(col("label") == 0.0).count()
+    # ---- stats (single action) ----
+    stats = feats.agg(
+        _count("*").alias("total"),
+        _sum(when(col("label") == 1.0, 1).otherwise(0)).alias("pos"),
+    ).collect()[0]
+    total = int(stats["total"])
+    pos = int(stats["pos"] or 0)
+    neg = total - pos
     print(f"[build_features] users={total} pos={pos} neg={neg}")
+
+    if pos == 0:
+        print("[build_features][WARN] pos=0 -> producer may not be sending label=1, or window has no fraud events yet.")
 
     # ---- write gold ----
     (
